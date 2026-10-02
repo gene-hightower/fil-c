@@ -3957,16 +3957,7 @@ Generic_GCC::addLibCxxIncludePaths(const llvm::opt::ArgList &DriverArgs,
     {
       llvm::SmallString<128> P =
         llvm::StringRef(getDriver().Dir); // <install>/bin
-      std::string IncludeTriple = getTripleString();
-      if (getTriple().isOSLinux() &&
-          (getTriple().getArch() == llvm::Triple::aarch64 ||
-           getTriple().getArch() == llvm::Triple::x86_64))
-        // Fil-C installs __config_site under these fixed triples, regardless
-        // of the requested architecture alias, Linux vendor, or libc name.
-        IncludeTriple =
-            (llvm::Triple::getArchTypeName(getTriple().getArch()) +
-             "-unknown-linux-gnu").str();
-      llvm::sys::path::append(P, "..", "include", IncludeTriple);
+      llvm::sys::path::append(P, "..", "include", getTripleString());
       llvm::sys::path::append(P, "c++", "v1");
       addSystemInclude(DriverArgs, CC1Args, P);
     }

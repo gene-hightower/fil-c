@@ -212,14 +212,6 @@ def err_drv_filc_fat_ape_input : Error<
   "cannot build a fat APE from '%0': '--filc-fat-ape' requires source inputs, since aarch64 objects cannot be derived from x86_64 object files">;
 def err_drv_filc_fat_ape_tree_missing : Error<
   "'--filc-fat-ape' requires the aarch64 cosmo libraries in the pizfix tree (build them with build_yolocosmo.sh), but %0 is missing">;
-def err_drv_filc_cross_assembler_missing : Error<
-  "cannot find a target assembler for %0; install target binutils or pass -B/path/to/target/bin">;
-def err_drv_filc_unsupported_arch : Error<
-  "unsupported Fil-C target architecture %0 (supported architectures: x86_64, aarch64)">;
-def err_drv_filc_cross_resource_dir_missing : Error<
-  "cross compiling for %0 requires --filc-resource-dir= pointing to that architecture's Fil-C pizfix">;
-def err_drv_filc_cross_pizfix_missing : Error<
-  "cross compiling for %0 needs that architecture's Fil-C pizfix: install it as %1 or pass --filc-resource-dir=">;
 def err_drv_invalid_Xarch_argument_with_args : Error<
   "invalid Xarch argument: '%0', options requiring arguments are unsupported">;
 def err_drv_Xopenmp_target_missing_triple : Error<

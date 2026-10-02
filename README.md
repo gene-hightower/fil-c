@@ -61,15 +61,6 @@ on Linux because it allows me to do a more faithful job of implementing libc.
 There's nothing fundamentally stopping Fil-C from working on other
 architectures or OSes other than Linux.
 
-The classic binary distribution's `setup.sh` and source builds require Linux
-userspace kernel headers: `kernel-headers` on Fedora/RHEL/Rocky,
-`linux-libc-dev` on Debian/Ubuntu, `linux-api-headers` on Arch, or
-`linux-glibc-devel` on openSUSE. Missing or incompatible headers are a fatal
-error, even if a particular program does not include kernel headers. Setup
-stops before relocating binaries and can be rerun after the headers are
-installed. `FILC_KERNEL_HEADERS=/path/to/include` overrides the header
-location with a directory containing `asm`, `asm-generic`, and `linux`.
-
 ## Getting Started
 
 If you downloaded Fil-C binaries, run:
@@ -109,16 +100,6 @@ If you are using source, then you can also:
   Linux distribution.
 
 - `cd optfil && sudo ./build.sh` - builds the `/opt/fil` distribution.
-
-## Cross Compiling
-
-The compiler can target both X86_64 and ARM64 on Linux, in either direction.
-To cross compile you need the other architecture's Fil-C runtime installed as
-`pizfix-<arch>` next to the compiler's `pizfix` (or pass `--filc-resource-dir=`
-pointing at it), binutils for the target (for example
-`binutils-aarch64-linux-gnu` on Debian/Ubuntu), and the target's kernel
-headers. See [cross_builds.txt](cross_builds.txt) for the full step-by-step
-guide.
 
 ## Things That Work
 
