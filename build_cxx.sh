@@ -183,6 +183,16 @@ fi
 # the same include_next-shadowing reason as the host ninja did.
 ./install-cxx-$OS.sh
 
+# __config_site is architecture-independent for matching libc/libc++ builds,
+# so mirror the host's copy under the target triple.  Skip this when the
+# aarch64 runtime build above already produced the real
+# $CROSSARCH-unknown-linux-gnu headers; those are the ones to keep.
+if ! test -e pizfix/lib-aarch64/libyolocosmo.a
+then
+    rm -rf build/include/$CROSSARCH-unknown-linux-gnu
+    cp -R build/include/$ARCH-unknown-linux-gnu build/include/$CROSSARCH-unknown-linux-gnu
+fi
+
 ./fix_clang.sh
 
 

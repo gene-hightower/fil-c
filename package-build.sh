@@ -66,6 +66,15 @@ then
     exit 1
 fi
 
+# The musl flavor's relocation loop (below) needs patchelf; fail before doing
+# anything destructive, like removing a previous package's directory, if it is
+# missing.  The cosmo flavor is static-only and never runs patchelf.
+if test "x$flavor" = "xmusl" && ! command -v patchelf >/dev/null 2>&1
+then
+    echo "error: patchelf is required to package Fil-C." >&2
+    exit 1
+fi
+
 build_name=$build_name_base-0.686-$OS-$ARCH
 
 rm -rf $build_name
@@ -99,6 +108,14 @@ then
     mkdir -p $build_name/build/include/aarch64-unknown-linux-gnu/
     cp -R build/include/aarch64-unknown-linux-gnu/c++ $build_name/build/include/aarch64-unknown-linux-gnu/
 fi
+# __config_site is architecture-independent for matching libc/libc++ builds;
+# install it under both target triples.  The cosmo flavor may already have
+# shipped the real $CROSSARCH-unknown-linux-gnu C++ headers (see above), so
+# only mirror the $ARCH ones when that directory does not exist yet.
+if ! test -e $build_name/build/include/$CROSSARCH-unknown-linux-gnu
+then
+    cp -R $build_name/build/include/$ARCH-unknown-linux-gnu $build_name/build/include/$CROSSARCH-unknown-linux-gnu
+fi
 mkdir -p $build_name/build/lib/clang/20/
 cp -R build/lib/clang/20/include $build_name/build/lib/clang/20/
 
@@ -129,6 +146,12 @@ echo '#!/bin/sh' > setup.sh
 echo 'set -e' >> setup.sh
 echo 'set -x' >> setup.sh
 
+# Share header validation with source builds. Embed it so setup.sh remains
+# self-contained, and fail before relocating any packaged binaries.
+echo "sh -s $ARCH <<'FILC_KERNEL_HEADERS_SETUP'" >> setup.sh
+cat ../build_os_include.sh >> setup.sh
+echo 'FILC_KERNEL_HEADERS_SETUP' >> setup.sh
+
 # The musl flavor links dynamically, so every dynamic binary in the package
 # needs its rpath and interpreter pointed at the package's own pizfix.  The
 # cosmo flavor is static-only (no shared libraries and no dynamic linker), so
@@ -137,14 +160,18 @@ if test "x$flavor" = "xmusl"
 then
     for binary in pizfix/lib/*.so pizfix/lib/*.so.* pizfix/lib64/*.so pizfix/lib64/*.so.* pizfix/bin/* pizfix/sbin/* pizfix/libexec/* pizfix/lib_test/*.so pizfix/lib_test_gcverify/*.so pizfix/lib_gcverify/*.so
     do
-        if test ! -L $binary && test $binary != pizfix/lib/libyoloc.so
+        if test -f "$binary" && test ! -L "$binary" && test "$binary" != pizfix/lib/libyoloc.so
         then
-            if patchelf --set-rpath pizfix/lib64:pizfix/lib $binary
+            # Probe separately: scripts and libraries without PT_INTERP are normal,
+            # but failure to relocate a recognized ELF file must abort packaging.
+            if patchelf --print-rpath "$binary" >/dev/null 2>&1
             then
+                patchelf --set-rpath pizfix/lib64:pizfix/lib "$binary"
                 echo "patchelf --set-rpath \$PWD/pizfix/lib64:\$PWD/pizfix/lib $binary" >> setup.sh
             fi
-            if patchelf --set-interpreter pizfix/lib/ld-fil1-$ARCH.so $binary
+            if patchelf --print-interpreter "$binary" >/dev/null 2>&1
             then
+                patchelf --set-interpreter pizfix/lib/ld-fil1-$ARCH.so "$binary"
                 echo "patchelf --set-interpreter \$PWD/pizfix/lib/ld-fil1-$ARCH.so $binary" >> setup.sh
             fi
         fi
@@ -164,19 +191,6 @@ then
     rm pizfix/lib/ld-fil1-$ARCH.so
     (cd pizfix/lib/ && ln -s libyoloc.so ld-fil1-$ARCH.so)
 fi
-
-echo "cd pizfix" >> setup.sh
-echo "mkdir os-include" >> setup.sh
-echo "cd os-include" >> setup.sh
-echo "ln -s /usr/include/linux ." >> setup.sh
-echo "if test -d /usr/include/x86_64-linux-gnu/asm" >> setup.sh
-echo "then" >> setup.sh
-echo "    ln -s /usr/include/x86_64-linux-gnu/asm ." >> setup.sh
-echo "else" >> setup.sh
-echo "    ln -s /usr/include/asm ." >> setup.sh
-echo "fi" >> setup.sh
-echo "ln -s /usr/include/asm-generic ." >> setup.sh
-echo "cd ../.." >> setup.sh
 
 if test "x$flavor" = "xcosmo"
 then

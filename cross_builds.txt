@@ -1,0 +1,270 @@
+# Cross Compiling With Fil-C
+
+Fil-C supports cross compilation between x86_64 and aarch64 on Linux, in
+either direction: an x86_64 compiler produces aarch64 binaries, and an
+aarch64 compiler produces x86_64 binaries. This document describes the
+post-merge cross-compilation behavior of the clang driver in this tree,
+what you have to install, a step-by-step walkthrough, and how to debug a
+broken setup. In quoted diagnostics below, %0, %1, ... are placeholders
+that the driver fills in with the actual architecture name or path when
+it prints the message.
+
+# What Is Supported
+
+- Target architectures: x86_64 and aarch64, on Linux, in either
+  direction.
+- No other target architecture is supported. On a classic (musl or
+  glibc) tree, anything else -- including -m32 -- makes the driver fail
+  up front with:
+      unsupported Fil-C target architecture %0 (supported architectures: x86_64, aarch64)
+  %0 is the architecture the driver derived from your triple. Use a
+  supported triple such as --target=x86_64-linux-gnu or
+  --target=aarch64-linux-gnu. In a cosmo tree (see Limitations) the
+  driver does not stop unsupported targets up front: they proceed into
+  the cosmo machinery, which only supports x86_64 and aarch64, so the
+  failure happens later, during the cosmo build/link, instead of as a
+  clean driver error.
+- Native compiles (no --target, or a --target that matches the
+  compiler's own architecture) are unaffected by everything in this
+  document.
+
+# How The Driver Picks The Target Runtime
+
+A Fil-C compiler always has its own (host) runtime in a pizfix
+directory next to the compiler binary. When a compilation's target
+architecture differs from the compiler's own architecture, the driver
+uses the TARGET architecture's runtime, installed as pizfix-<arch> NEXT
+TO the compiler's pizfix:
+
+    <compiler-prefix>/pizfix            host architecture's runtime
+    <compiler-prefix>/pizfix-aarch64    target runtime (x86_64 compiler)
+    <compiler-prefix>/pizfix-x86_64     target runtime (aarch64 compiler)
+
+<arch> is always the canonical name: x86_64 or aarch64.
+
+In the source tree the compiler is build/bin/clang, so the compiler
+prefix is the repository root and the target runtime for an x86_64
+compiler goes at:
+
+    <repo-root>/pizfix-aarch64
+
+If the target runtime is missing, the driver fails in one of two ways:
+- There is a pizfix next to the compiler, but no pizfix-<arch> sibling:
+      cross compiling for aarch64 needs that architecture's Fil-C pizfix: install it as <path> or pass --filc-resource-dir=
+  <path> is exactly where the driver looked; create the symlink there.
+- There is no neighboring pizfix at all -- for example /opt/fil-style or
+  pizlix-style installs, where the compiler is not installed next to a
+  pizfix directory:
+
+      cross compiling for %0 requires --filc-resource-dir= pointing to that architecture's Fil-C pizfix
+
+--filc-resource-dir=<dir> always overrides the automatic choice. It must
+point at the target architecture's pizfix (the directory containing the
+target's lib/, os-include/, and so on).
+
+Queries that do not need the target runtime still work without one:
+
+    clang --version
+    clang -dumpmachine
+    clang -print-resource-dir
+    clang -print-prog-name=as
+
+-print-prog-name=as errors until a cross assembler is available. That
+is intentional: there is no correct answer to that query until target
+binutils are installed.
+
+# What You Need
+
+Cross compiling needs three things.
+
+## 1. The target's Fil-C runtime
+
+Installed as pizfix-<arch> next to the compiler's pizfix (see the
+previous section). The easy source is the binary distribution of the
+SAME release for the other architecture: unpack it somewhere, run its
+setup.sh on this host as usual (this validates kernel headers and
+relocates the runtime), then symlink its pizfix as pizfix-<arch>.
+Alternatively, build the runtime from source.
+
+The compiler supplies the shared libc++ headers and __config_site for
+the target compilation, so the target runtime does not need libc++
+itself. But the libc flavor must match between the compiler build and
+the target runtime: a glibc source build cannot use a musl binary
+release's target runtime, and vice versa. The libc flavor and the libc++
+configuration have to agree; for source builds, use the same Fil-C
+revision.
+
+## 2. Target binutils
+
+The cross linker and assembler. On Debian/Ubuntu, for example:
+
+    sudo apt install binutils-aarch64-linux-gnu     # x86_64 -> aarch64
+    sudo apt install binutils-x86-64-linux-gnu      # aarch64 -> x86_64
+
+clang then finds aarch64-linux-gnu-ld / aarch64-linux-gnu-as
+automatically. The lookup falls back to the canonical
+<arch>-linux-gnu-<tool> names from every spelling of the triple:
+canonical (aarch64-linux-gnu), aliases (arm64-linux-gnu,
+amd64-linux-gnu), vendor triples (aarch64-redhat-linux-gnu), and musl
+triples (aarch64-linux-musl).
+
+An explicit -B/path/to/target/bin, or a detected cross GCC installation,
+also works.
+
+A bare host `as` found beside the compiler or on PATH is deliberately
+rejected for cross assembly -- it could silently assemble for the wrong
+architecture -- producing:
+
+    cannot find a target assembler for %0; install target binutils or pass -B/path/to/target/bin
+
+## 3. Target kernel UAPI headers
+
+These end up in the target runtime's pizfix-<arch>/os-include. On
+Debian/Ubuntu the cross header packages install them for you;
+linux-libc-dev-arm64-cross provides
+/usr/aarch64-linux-gnu/include/{asm,asm-generic,linux}, and equivalent
+packages exist for the reverse direction.
+
+Or point setup.sh at the headers yourself:
+
+    FILC_KERNEL_HEADERS=/path/to/<target>/include ./setup.sh
+
+where the directory contains asm, asm-generic, and linux.
+
+The binary distribution's setup.sh validates the headers by CONTENT,
+never by `uname`:
+- x86_64 headers: asm/posix_types_64.h must be present and asm/hwcap.h
+  must NOT be present.
+- aarch64 headers: asm/hwcap.h must be present and define HWCAP_ASIMD.
+That is what makes setup work in emulated containers, where uname
+reports the emulated host rather than the real machine. Missing,
+wrong-architecture, or mixed headers are fatal. Setup fails BEFORE
+relocating any binaries, with a message listing the distro header
+packages; after installing the headers, simply rerun setup.sh.
+
+Source builds run the same checks via build_os_include.sh, which
+build_base.sh calls at the very start.
+
+# Step By Step: x86_64 Host, aarch64 Target
+
+1. Install target binutils and headers (Debian/Ubuntu; use your
+   distro's equivalent elsewhere):
+
+       sudo apt install binutils-aarch64-linux-gnu linux-libc-dev-arm64-cross
+
+2. Get the aarch64 Fil-C binary distribution of the same release
+   (filc-<version>-linux-aarch64.tar.xz; 0.686 is the current example,
+   i.e. filc-0.686-linux-aarch64.tar.xz). Unpack it somewhere and run
+   its setup.sh; this validates the aarch64 kernel headers on this
+   machine and relocates the runtime. If the headers live elsewhere:
+
+       FILC_KERNEL_HEADERS=/usr/aarch64-linux-gnu/include ./setup.sh
+
+3. Link it next to your compiler:
+
+       ln -s /path/to/filc-<version>-linux-aarch64/pizfix pizfix-aarch64
+
+   For a source build (compiler at build/bin/clang), the sibling goes
+   at the repository root:
+
+       ln -s /path/to/filc-<version>-linux-aarch64/pizfix <repo-root>/pizfix-aarch64
+
+4. Compile:
+
+       build/bin/clang --target=aarch64-linux-gnu -o whatever whatever.c -O2 -g
+
+   Use build/bin/clang++ for C++. The reverse direction (aarch64
+   compiler, x86_64 target) is identical, with pizfix-x86_64 and the
+   x86-64 binutils.
+
+5. Running the result on the target machine. The binary records the
+   target runtime's dynamic loader --
+   pizfix-<arch>/lib/ld-fil1-<arch>.so as installed on the target --
+   and the library paths. Install the target distribution at those
+   paths on the target machine, or, for a different layout, pass
+   --filc-dynamic-linker=<path> and -Wl,-rpath,<dir> at link time.
+   Quick smoke test without a second machine:
+
+       qemu-aarch64 -L <aarch64-sysroot> ./whatever
+
+   after pointing the loader/rpath at the unpacked aarch64 distribution
+   (or use qemu with the distribution's ld as the dynamic linker).
+   Under qemu-user emulation, remember that uname reports the host --
+   which is exactly why header validation is content-based.
+
+# Testing Your Cross Setup
+
+1. Dry run with -###, which prints what would run without running it:
+       build/bin/clang --target=aarch64-linux-gnu -### -x c /dev/null
+   Verify the include paths, os-include, Scrt1.o, and
+   ld-fil1-aarch64.so come from pizfix-aarch64 and NOT from the host
+   pizfix. Verify the linker and assembler are aarch64-linux-gnu-
+   prefixed.
+
+2. Freestanding compile and assemble, which needs no target libc. Write
+   `int main(){return 42;}` to /tmp/fs.c, then:
+       build/bin/clang --target=aarch64-linux-gnu -c -o /tmp/fs.o /tmp/fs.c
+       file /tmp/fs.o
+
+   file must say the object is aarch64. This exercises the cross
+   sarcasm + target assembler path: sarcasm (Fil-C's pizlonating
+   assembler) is run from the compiler's OWN pizfix and told
+   --as <target-as>; the target pizfix's sarcasm is itself a target
+   binary and is never used.
+
+3. A full link needs the real target runtime (step 3 of the walkthrough
+   above). If pieces are missing, you get the diagnostics below.
+
+# Troubleshooting
+
+Each diagnostic, and its fix:
+
+- unsupported Fil-C target architecture X (supported architectures: x86_64, aarch64)
+      Wrong --target, including -m32. Use a supported triple. This
+      diagnostic fires on classic (musl/glibc) trees; in a cosmo tree an
+      unsupported --target is not caught up front (see Limitations).
+- cross compiling for %0 requires --filc-resource-dir= pointing to that architecture's Fil-C pizfix
+      The compiler is installed without a neighboring pizfix (/opt/fil,
+      pizlix). Pass --filc-resource-dir=<target pizfix>.
+- cross compiling for %0 needs that architecture's Fil-C pizfix: install it as %1 or pass --filc-resource-dir=
+      Create the pizfix-<arch> symlink at the printed path (%1), or
+      pass --filc-resource-dir=.
+- cannot find a target assembler for %0; install target binutils or pass -B/path/to/target/bin
+      Install binutils-<arch>-linux-gnu, or -B a directory with the
+      target's bare as/ld. Do not -B at /usr/bin: that selects the bare
+      host tools, which is exactly what cross assembly must avoid.
+- setup.sh / build_os_include.sh: "error: missing <arch> kernel headers ..." with distro package names and the FILC_KERNEL_HEADERS= suggestion
+      Install the listed package, or set FILC_KERNEL_HEADERS= to a
+      directory containing asm, asm-generic, and linux for the target
+      architecture, then rerun setup. Failed setup preserves previously
+      created links, and since setup fails before relocating any
+      binaries, rerunning is safe.
+- Kernel headers need to be pointed somewhere else at compile time
+      --filc-os-include=<dir> overrides the configured kernel header
+      directory.
+
+# Limitations
+
+- Only x86_64 and aarch64, on Linux, in either direction. Anything else
+  fails as described above.
+- The libc flavor must match between the compiler build and the target
+  runtime (musl vs glibc vs cosmo).
+- The pizfix-<arch> requirement described above applies to classic
+  (musl/glibc) cross builds. Cosmo cross builds (--filc-cosmo,
+  --filc-fat-ape) are different: the cosmo machinery keeps the
+  per-architecture runtimes INSIDE the single pizfix (pizfix/lib for the
+  host architecture and pizfix/lib-aarch64 for aarch64, see
+  build_yolocosmo.sh), so it does not use pizfix-<arch> trees at all and
+  no cosmo script creates them. The driver detects a cosmo tree by its
+  libyolocosmo.a marker and exempts such trees from the pizfix-<arch>
+  redirect and from the "cross compiling ... needs that architecture's
+  Fil-C pizfix" error: a cross cosmo compile keeps using the neighboring
+  pizfix, which contains both architectures' runtimes. The cosmo
+  exemption also skips the unsupported-architecture check, so an
+  unsupported --target (i686, -m32, riscv64, ...) in a cosmo tree is not
+  rejected up front and proceeds into the cosmo machinery -- which only
+  supports x86_64 and aarch64 -- failing later there. The cosmo
+  machinery otherwise has its own per-architecture layout; it exists,
+  but it is out of scope for this document.
+- Native compiles are unaffected by all of the above.
+
