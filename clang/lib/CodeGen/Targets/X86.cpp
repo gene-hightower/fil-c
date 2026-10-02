@@ -2567,35 +2567,8 @@ GetX86_64ByValArgumentPair(llvm::Type *Lo, llvm::Type *Hi,
   return Result;
 }
 
-// Fil-C: a union is passed and returned in memory, because a union's
-// eightbytes can hold a pointer on one path and an integer on another, and
-// coercing them to integer registers drops the pointer's capability. The
-// same holds for a union nested in a struct or array, e.g. the storage of
-// std::variant<long, int *>.
-static bool containsUnion(QualType Ty, ASTContext &Context) {
-  if (const ConstantArrayType *AT = Context.getAsConstantArrayType(Ty))
-    return containsUnion(AT->getElementType(), Context);
-  const RecordType *RT = Ty->getAs<RecordType>();
-  if (!RT)
-    return false;
-  const RecordDecl *RD = RT->getDecl();
-  if (RD->isUnion())
-    return true;
-  if (const CXXRecordDecl *CXXRD = dyn_cast<CXXRecordDecl>(RD))
-    for (const CXXBaseSpecifier &B : CXXRD->bases())
-      if (containsUnion(B.getType(), Context))
-        return true;
-  for (const FieldDecl *FD : RD->fields())
-    if (containsUnion(FD->getType(), Context))
-      return true;
-  return false;
-}
-
 ABIArgInfo X86_64ABIInfo::
 classifyReturnType(QualType RetTy) const {
-  if (RetTy->isUnionType() || containsUnion(RetTy, getContext()))
-    return getIndirectReturnResult(RetTy);
-  
   // AMD64-ABI 3.2.3p4: Rule 1. Classify the return type with the
   // classification algorithm.
   X86_64ABIInfo::Class Lo, Hi;
@@ -2729,11 +2702,7 @@ X86_64ABIInfo::classifyArgumentType(QualType Ty, unsigned freeIntRegs,
   Ty = useFirstFieldIfTransparentUnion(Ty);
 
   X86_64ABIInfo::Class Lo, Hi;
-  if (Ty->isUnionType() || containsUnion(Ty, getContext())) {
-    Lo = Memory;
-    Hi = NoClass;
-  } else
-    classify(Ty, 0, Lo, Hi, isNamedArg, IsRegCall);
+  classify(Ty, 0, Lo, Hi, isNamedArg, IsRegCall);
 
   // Check some invariants.
   // FIXME: Enforce these by construction.
