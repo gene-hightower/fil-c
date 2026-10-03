@@ -223,6 +223,7 @@ struct CGRecordLowering {
   llvm::DenseMap<const CXXRecordDecl *, unsigned> VirtualBases;
   bool IsZeroInitializable : 1;
   bool IsZeroInitializableAsBase : 1;
+  bool IsFilPtrUnion : 1;
   bool Packed : 1;
 private:
   CGRecordLowering(const CGRecordLowering &) = delete;
@@ -236,7 +237,7 @@ CGRecordLowering::CGRecordLowering(CodeGenTypes &Types, const RecordDecl *D,
       RD(dyn_cast<CXXRecordDecl>(D)),
       Layout(Types.getContext().getASTRecordLayout(D)),
       DataLayout(Types.getDataLayout()), IsZeroInitializable(true),
-      IsZeroInitializableAsBase(true), Packed(Packed) {}
+      IsZeroInitializableAsBase(true), IsFilPtrUnion(false), Packed(Packed) {}
 
 void CGRecordLowering::setBitFieldInfo(
     const FieldDecl *FD, CharUnits StartOffset, llvm::Type *StorageType) {
@@ -402,7 +403,7 @@ void CGRecordLowering::lowerUnion(bool isNonVirtualBaseType) {
       StorageType = FieldType;
   }
   // If we are zero-initializable and have pointers, create a type consisting of pointers.
-  if (IsZeroInitializable && HasPointers) {
+  if (HasPointers) {
     std::vector<llvm::Type*> Ts;
     CharUnits RemainingSize = LayoutSize;
     while (RemainingSize >= CharUnits::fromQuantity(8)) {
@@ -422,6 +423,7 @@ void CGRecordLowering::lowerUnion(bool isNonVirtualBaseType) {
     }
     assert(LayoutSize == getSize(NewStorageType));
     StorageType = NewStorageType;
+    IsFilPtrUnion = true;
   }
   // If we have no storage type just pad to the appropriate size and return.
   if (!StorageType)
@@ -1168,6 +1170,8 @@ CodeGenTypes::ComputeRecordLayout(const RecordDecl *D, llvm::StructType *Ty) {
       // on both of them with the same index.
       assert(Builder.Packed == BaseBuilder.Packed &&
              "Non-virtual and complete types must agree on packedness");
+      assert(Builder.IsFilPtrUnion == BaseBuilder.IsFilPtrUnion &&
+             "Non-virtual and complete types must agree on pizlness");
     }
   }
 
@@ -1178,7 +1182,8 @@ CodeGenTypes::ComputeRecordLayout(const RecordDecl *D, llvm::StructType *Ty) {
 
   auto RL = std::make_unique<CGRecordLayout>(
       Ty, BaseTy, (bool)Builder.IsZeroInitializable,
-      (bool)Builder.IsZeroInitializableAsBase);
+      (bool)Builder.IsZeroInitializableAsBase,
+      (bool)Builder.IsFilPtrUnion);
 
   RL->NonVirtualBases.swap(Builder.NonVirtualBases);
   RL->CompleteObjectVirtualBases.swap(Builder.VirtualBases);
@@ -1285,6 +1290,7 @@ void CGRecordLayout::print(raw_ostream &OS) const {
   if (BaseSubobjectType)
     OS << "  NonVirtualBaseLLVMType:" << *BaseSubobjectType << "\n";
   OS << "  IsZeroInitializable:" << IsZeroInitializable << "\n";
+  OS << "  IsFilPtrUnion:" << IsFilPtrUnion << "\n";
   OS << "  BitFields:[\n";
 
   // Print bit-field infos in declaration order.
