@@ -48,6 +48,7 @@ int usage(const char* arg0, bool err)
             "  mv <f.projeny|dir> <src> <dst>\n"
             "  resolve <f.projeny|dir> <path>\n"
             "  rebase <f.projeny|dir> <new-tarball>\n"
+            "  rebase <f.projeny|dir> <url> [<hash>] [<url> [<hash>]...]\n"
             "  status <f.projeny|dir>\n"
             "  diff <f.projeny|dir>\n"
             "  diff <dir> <other-dir>\n"
@@ -281,9 +282,11 @@ int main(int argc, char** argv)
             return cmd_resolve(args[1], args[2]);
         }
         if (cmd == "rebase") {
-            if (args.size() != 3)
+            if (args.size() < 3)
                 return usage(arg0.c_str(), true);
-            return cmd_rebase(args[1], args[2]);
+            return cmd_rebase(args[1],
+                              std::vector<std::string>(args.begin() + 2,
+                                                       args.end()));
         }
         if (cmd == "status") {
             if (args.size() != 2)

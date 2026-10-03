@@ -3070,8 +3070,56 @@ void replay_pending_ops(const StatusData& st, const std::string& workdir,
         remove_recursive(join_path(root, r));
 }
 
-int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
+int cmd_rebase(const std::string& projeny_arg,
+               const std::vector<std::string>& new_archive_args)
 {
+    // Argument parsing, before anything is touched: the FIRST argument
+    // decides the mode. A string curl's URL parser accepts (see arg_is_url)
+    // starts a URL: header list — one or more <url> [<blake3-hash>] pairs,
+    // which rebases the project onto those URLs (and converts an
+    // Archive:-based project to URL:-based). Anything else is the legacy
+    // form: exactly one local tarball path.
+    bool url_mode =
+        !new_archive_args.empty() && arg_is_url(new_archive_args[0]);
+    std::vector<ProjenyUrl> urls;
+    std::string new_tarball;
+    if (!url_mode) {
+        if (new_archive_args.size() != 1)
+            die("rebase takes exactly one new tarball path (or URL(s): "
+                "'projeny rebase <f.projeny|dir> <url> [<blake3-hash>] "
+                "[<url> [<blake3-hash>]...])");
+        new_tarball = new_archive_args[0];
+    } else {
+        for (size_t i = 0; i < new_archive_args.size(); ++i) {
+            const std::string& a = new_archive_args[i];
+            // The first argument's URL-ness is already settled — it chose
+            // URL mode above — so only the later arguments pay for a parse.
+            if (i == 0 || arg_is_url(a)) {
+                ProjenyUrl u;
+                u.url = a;
+                urls.push_back(u);
+                continue;
+            }
+            // A non-URL argument is the blake3 hash of the URL before it:
+            // the same 64-hex rule a .projeny file's "URL: <url> <hash>"
+            // header and `projeny download` apply, normalized to lowercase.
+            if (urls.empty() || !urls.back().hash.empty())
+                die("rebase URL arguments come as <url> [<blake3-hash>] "
+                    "pairs; '" + a + "' does not follow a hash-less URL");
+            std::string lower;
+            bool ok = a.size() == 64;
+            for (char c : a) {
+                if (!isxdigit(static_cast<unsigned char>(c)))
+                    ok = false;
+                lower.push_back(static_cast<char>(
+                    tolower(static_cast<unsigned char>(c))));
+            }
+            if (!ok)
+                die("invalid blake3 hash '" + a + "' for " + urls.back().url);
+            urls.back().hash = lower;
+        }
+    }
+
     // Absolutize up front: this command replaces the workdir, which can
     // delete the directory the process's CWD sits in (`projeny rebase ..`
     // from a workdir subdirectory); every later path must not need the
@@ -3079,8 +3127,24 @@ int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
     std::string pj = absolutize(resolve_projeny_path(projeny_arg, "rebase"));
     Ctx ctx = resolve_ctx(pj);
 
-    // If status/workdir are missing, do a setup first.
+    // The tarball form is refused for a URL-based project BEFORE the
+    // setup-first fallback below: that fallback runs a full setup, which for
+    // a URL project means downloading the archive — a refusal must never
+    // cost a download, and must never create the checkout it refuses to
+    // serve. The on-disk file decides: when the status file exists,
+    // require_status_matches below enforces that it is byte-identical to the
+    // status copy this same file would be re-parsed from.
     ProjenyFile cur0 = ProjenyFile::parse(ctx.projeny_arg);
+    if (cur0.is_url_based() && !url_mode)
+        die("cannot rebase '" + ctx.projeny_arg +
+            "' with a tarball path: it is a URL-based project (URL: headers; "
+            "no Archive: tarball is checked into git); rebase it with URL(s) "
+            "instead: projeny rebase " + ctx.projeny_arg +
+            " <url> [<blake3-hash>] ... (when the hash is omitted, projeny "
+            "downloads the tarball and computes the hash; 'projeny hash "
+            "<file>' computes it for a local file)");
+
+    // If status/workdir are missing, do a setup first.
     std::string workdir0 = join_path(ctx.pdir, cur0.name);
     if (!path_exists(ctx.statusfile) || !is_dir(workdir0)) {
         printf("projeny: no setup yet; running setup first\n");
@@ -3090,17 +3154,6 @@ int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
     StatusData st = require_status_matches(ctx);
     ProjenyFile cur =
         ProjenyFile::parse_bytes(st.embedded, "'" + ctx.projeny_arg + "'");
-    if (cur.is_url_based())
-        die("cannot rebase '" + ctx.projeny_arg +
-            "': it is a URL-based project (URL: headers; no Archive: tarball "
-            "is checked into git). To move it to a new archive, edit its "
-            "URL: header(s) to the new archive's URL and blake3 hash "
-            "(compute the hash with 'projeny hash <file>') and run 'projeny "
-            "setup', which merges your local changes onto the new base. To "
-            "convert it to a checked-in tarball first, remove the URL: "
-            "lines by hand and add an 'Archive: <filename>' header naming "
-            "the tarball placed next to the .projeny file (do that BEFORE "
-            "running rebase)");
     std::string workdir = join_path(ctx.pdir, cur.name);
     if (!is_dir(workdir))
         die("workdir '" + workdir + "' is missing; run setup first");
@@ -3137,29 +3190,124 @@ int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
                 "' has uncommitted changes; commit or revert before rebasing");
     }
 
-    if (!path_exists(new_tarball))
-        die("new tarball '" + new_tarball + "' does not exist");
-    std::string new_base = basename_of(new_tarball);
-    if (new_base.empty() || new_base.find('/') != std::string::npos)
-        die("bad tarball path '" + new_tarball + "'");
+    // The new archive: either the copied-in tarball (legacy) or the verified
+    // download (URL mode — its bytes stay in memory and are unpacked from a
+    // scratch copy; the snapshot itself is written only at the very end, just
+    // before write_status).
+    std::string dest_archive;
+    std::string new_base;      // the new archive's basename (report + headers)
+    std::string verified_data; // URL mode: the verified new tarball's bytes
+    // URL mode's scratch home for those bytes (see below); legacy rebases
+    // never write into it.
+    TempDir tURL(scratch_parent_for(ctx.pdir), "projeny-rebase-url-");
+    if (url_mode) {
+        // URL mode: download+verify EVERY listed URL before anything is
+        // written, so a hard error below leaves the .projeny file, the
+        // status file, the snapshot, and the workdir untouched. Each
+        // distinct URL downloads once. Every entry must end up verified:
+        // a hashed one verifies without changing anything, a hashless one
+        // gets its hash computed (and its bytes may become the archive).
+        new_base = archive_name_from_url(urls[0].url);
+        if (new_base.empty())
+            die("URL '" + urls[0].url + "' does not name a file");
+        std::map<std::string, std::pair<bool, std::string>> fetched;
+        bool have_verified = false;
+        for (ProjenyUrl& u : urls) {
+            bool ok;
+            std::string data, err;
+            auto it = fetched.find(u.url);
+            if (it == fetched.end()) {
+                // try_download announces the attempt itself ("projeny:
+                // downloading '<url>'", then '\r'-terminated progress).
+                ok = try_download(u.url, &data, &err);
+                fetched[u.url] = {ok, ok ? data : err};
+            } else {
+                ok = it->second.first;
+                if (ok)
+                    data = it->second.second;
+                else
+                    err = it->second.second;
+            }
+            if (!ok) {
+                if (u.hash.empty())
+                    // Without a hash there is nothing to record: a URL:
+                    // header always carries one, so this is a hard error.
+                    die("cannot compute the blake3 hash of '" + u.url +
+                        "': " + err +
+                        "; pass the hash explicitly after the URL "
+                        "('projeny hash <file>' computes it) — a URL: "
+                        "header always carries a hash");
+                // A hashed mirror that fails to download only warns: the
+                // line stays listed in the .projeny file, and a later
+                // setup falls through it exactly the same way.
+                warn("could not download '" + u.url + "': " + err +
+                     "; trying the next URL");
+                continue;
+            }
+            std::string have = blake3_hash_hex(data);
+            if (!u.hash.empty() && have != u.hash)
+                // The user asserted this hash: a mismatch is a hard error,
+                // not a mirror fall-through — a bad pair must not be
+                // silently written into the file.
+                die("downloaded '" + u.url + "' but its blake3 hash is " +
+                    have + ", expected " + u.hash +
+                    "; the hash was given explicitly, so projeny stops "
+                    "instead of writing a mismatched URL: header");
+            if (u.hash.empty()) {
+                u.hash = have;
+                note("computed blake3 hash " + have + " for '" + u.url + "'");
+            }
+            if (!have_verified) {
+                // The FIRST verified entry's bytes are the new tarball
+                // (the snapshot is named after the first URL regardless).
+                have_verified = true;
+                verified_data = data;
+            }
+        }
+        if (!have_verified)
+            die("no URL argument produced a verified download; not rebasing '" +
+                ctx.projeny_arg + "' (nothing was changed)");
+        // The verified bytes become the rebase's working archive as a scratch
+        // file in tURL — deliberately NOT the snapshot: the snapshot is the
+        // checkout's only local copy of the base the .projeny file still
+        // records, so clobbering it here would brick the checkout when
+        // anything below died (a garbage tarball, a merge-time error) with
+        // new_base == cur.archive, and would send the conflict path's
+        // old-tree materialization back to the old URL mid-rebase even when
+        // that URL is alive. It is also not tmp.path below:
+        // unpack_single_top requires its destination to end up with exactly
+        // one top-level entry, which the scratch file would spoil. The real
+        // snapshot — named after the FIRST URL's basename, the same
+        // derivation ProjenyFile::parse applies to the rewritten file — is
+        // written late, right before write_status (see below), once the
+        // .projeny file and the workdir are final.
+        dest_archive = join_path(tURL.path, new_base);
+        write_file_bytes(dest_archive, verified_data);
+    } else {
+        if (!path_exists(new_tarball))
+            die("new tarball '" + new_tarball + "' does not exist");
+        new_base = basename_of(new_tarball);
+        if (new_base.empty() || new_base.find('/') != std::string::npos)
+            die("bad tarball path '" + new_tarball + "'");
 
-    // Copy the tarball into pdir if it isn't already there. When the new
-    // tarball's basename matches the current Archive but its bytes differ,
-    // warn (content changed under a familiar name) and continue with the new
-    // file — never silently keep the old bytes.
-    std::string dest_archive = join_path(ctx.pdir, new_base);
-    std::string new_abs = absolutize(new_tarball);
-    std::string dest_abs = absolutize(dest_archive);
-    if (new_base == cur.archive && path_exists(dest_archive) &&
-        new_abs != dest_abs) {
-        if (file_hash_hex(new_tarball) != file_hash_hex(dest_archive) ||
-            file_size_bytes(new_tarball) != file_size_bytes(dest_archive))
-            warn("tarball '" + new_base +
-                 "' differs from the current '" + cur.archive +
-                 "'; using the new file");
+        // Copy the tarball into pdir if it isn't already there. When the new
+        // tarball's basename matches the current Archive but its bytes differ,
+        // warn (content changed under a familiar name) and continue with the new
+        // file — never silently keep the old bytes.
+        dest_archive = join_path(ctx.pdir, new_base);
+        std::string new_abs = absolutize(new_tarball);
+        std::string dest_abs = absolutize(dest_archive);
+        if (new_base == cur.archive && path_exists(dest_archive) &&
+            new_abs != dest_abs) {
+            if (file_hash_hex(new_tarball) != file_hash_hex(dest_archive) ||
+                file_size_bytes(new_tarball) != file_size_bytes(dest_archive))
+                warn("tarball '" + new_base +
+                     "' differs from the current '" + cur.archive +
+                     "'; using the new file");
+        }
+        if (new_abs != dest_abs)
+            copy_file_bytes(new_tarball, dest_archive);
     }
-    if (new_abs != dest_abs)
-        copy_file_bytes(new_tarball, dest_archive);
 
     std::string new_origname = archive_single_top_name(dest_archive);
 
@@ -3230,11 +3378,20 @@ int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
         frozen[rn.second] = ts;
     }
 
-    // Update headers: Archive: -> new basename, Origname: -> new top dir.
-    // The patch body's wid labels already use Name (unchanged).
-    cur.head = replace_header_value(cur.head, "Archive", new_base);
+    // Update headers: the archive location (Archive: for a checked-in
+    // tarball; the URL: list for URL mode — replace_archive_url_headers
+    // swaps every Archive:/URL: line for the new URL: lines, so an
+    // Archive:-based project converts to URL:-based here) plus the new top
+    // dir. The patch body's wid labels already use Name (unchanged).
+    if (url_mode) {
+        cur.head = replace_archive_url_headers(cur.head, urls);
+        cur.urls = urls;
+        cur.archive = new_base;
+    } else {
+        cur.head = replace_header_value(cur.head, "Archive", new_base);
+        cur.archive = new_base;
+    }
     cur.head = replace_header_value(cur.head, "Origname", new_origname);
-    cur.archive = new_base;
     cur.origname = new_origname;
     // Regenerate the patch against the new base so hunk positions/counts are
     // exact (content is base+patch by construction). The regenerated patch
@@ -3259,6 +3416,19 @@ int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball)
         die("cannot remove existing workdir '" + workdir + "'");
     move_path(tree, workdir);
     tmp.release();
+
+    // NOW the URL snapshot: the .projeny file has been rewritten and the
+    // workdir swapped, so every die before this point left the .projeny
+    // file, the status file, the snapshot, and the workdir exactly as they
+    // were. It must be in place before write_status, whose
+    // ensure_url_snapshot re-check takes a snapshot already matching a
+    // listed hash as the archive (one written here would otherwise be
+    // re-downloaded); both merge outcomes — a clean tree and conflicts left
+    // as markers — reach this line. write_file_bytes is temp file + rename,
+    // so the snapshot switches atomically.
+    if (url_mode)
+        write_file_bytes(snapshot_path_for(join_path(ctx.pdir, new_base)),
+                         verified_data);
 
     StatusData sd;
     sd.status = "setup";
@@ -5504,6 +5674,8 @@ int cmd_help(const std::string& arg0)
            "  mv <f.projeny|dir> <src> <dst>   rename a file, mark as renamed\n"
            "  resolve <f.projeny|dir> <path>   clear a conflict marker entry\n"
            "  rebase <f.projeny|dir> <tarball> point the project at a new tarball\n"
+           "  rebase <f.projeny|dir> <url> [<hash>]...\n"
+           "                                   ...or at new URL: header(s)\n"
            "  status <f.projeny|dir>           show setup/conflict/pending state\n"
            "  diff <f.projeny|dir>             print a checkout's uncommitted diff\n"
            "  diff <dir> <other-dir>           print the diff between two trees\n"
@@ -5793,23 +5965,60 @@ int cmd_help_topic(const std::string& arg0, const std::string& topic)
     }
     if (topic == "rebase") {
         printf("%s rebase <f.projeny|dir> <new-tarball>\n"
+               "%s rebase <f.projeny|dir> <url> [<blake3-hash>] "
+               "[<url> [<blake3-hash>]...]\n"
                "\n"
-               "Point the project at a new tarball: apply the current patch\n"
-               "onto the new base, rewrite the Archive:/Origname: headers,\n"
-               "regenerate the patch, and move the result into the workdir.\n"
-               "The tree must be clean (no uncommitted changes) and have no\n"
-               "pending conflicts; when never set up, runs `setup` first.\n"
-               "Conflicts leave markers and are recorded in the status file.\n"
-               "Pending add/rm/mv operations are preserved. When the new\n"
-               "tarball reuses the current Archive basename with different\n"
-               "bytes, projeny warns on stderr and uses the new file.\n"
+               "Point the project at a new base: apply the current patch\n"
+               "onto it, rewrite the archive-location and Origname:\n"
+               "headers, regenerate the patch, and move the result into\n"
+               "the workdir. The tree must be clean (no uncommitted\n"
+               "changes) and have no pending conflicts; when never set\n"
+               "up, runs `setup` first. Conflicts leave markers and are\n"
+               "recorded in the status file. Pending add/rm/mv operations\n"
+               "are preserved.\n"
+               "\n"
+               "Which form the new-archive arguments take decides the\n"
+               "mode, and the FIRST argument decides that: a string\n"
+               "libcurl's URL parser accepts (http://, https://, ftp://,\n"
+               "ftps://, file://) starts URL mode, anything else is a\n"
+               "local tarball path.\n"
+               "\n"
+               "With one local tarball path, the project keeps its\n"
+               "checked-in Archive: form: the tarball is copied next to\n"
+               "the .projeny file, Archive:/Origname: are rewritten, and\n"
+               "when the new tarball reuses the current Archive basename\n"
+               "with different bytes, projeny warns on stderr and uses\n"
+               "the new file. A URL:-based project has no checked-in\n"
+               "tarball, so this form refuses.\n"
+               "\n"
+               "With URL arguments, the URLs (each optionally followed by\n"
+               "its blake3 hash — the same 64-hex value `projeny hash`\n"
+               "computes, uppercase accepted) become the file's new\n"
+               "URL: headers, tried in order by later setups. An\n"
+               "Archive:-based project converts to URL:-based (the\n"
+               "Archive: header is replaced; remove the old checked-in\n"
+               "tarball from git by hand); a URL:-based project gets new\n"
+               "URL: headers. Every listed URL is downloaded and\n"
+               "verified during the rebase, each distinct URL once: a\n"
+               "hashless URL that cannot be downloaded is a hard error\n"
+               "(no hash could be computed), a provided hash that\n"
+               "mismatches is a hard error (the hash was asserted), and\n"
+               "a hashed URL that fails to download only warns (the\n"
+               "mirror stays listed, and a later setup falls through it\n"
+               "the same way). An omitted hash is computed from the\n"
+               "download and reported. If no URL verifies, nothing is\n"
+               "rebased and every file is left untouched. The first\n"
+               "verified download's bytes are written to the snapshot,\n"
+               "named after the FIRST URL's basename; the rest of the\n"
+               "rebase (clean tree, conflicts leave markers, resolve +\n"
+               "commit) works exactly as with a tarball.\n"
                "\n"
                "Like every project-taking command, the <f.projeny> argument\n"
                "may also be the workdir or another directory holding exactly\n"
                "one .projeny file, or a path whose '<arg>.projeny' sibling\n"
                "exists (typically a missing checkout directory, or a bare\n"
                "name like 'fake' for 'fake.projeny').\n",
-               t);
+               t, t);
         return 0;
     }
     if (topic == "status") {

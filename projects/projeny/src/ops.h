@@ -54,7 +54,15 @@ int cmd_rm(const std::string& projeny_arg, const std::string& path);
 int cmd_mv(const std::string& projeny_arg, const std::string& src,
            const std::string& dst);
 int cmd_resolve(const std::string& projeny_arg, const std::string& path);
-int cmd_rebase(const std::string& projeny_arg, const std::string& new_tarball);
+
+// Move the project's patch onto a new base archive. `new_archive_args` is
+// the tail after the project argument: either exactly one local tarball
+// path (legacy rebase of an Archive:-based project), or one or more URLs
+// each optionally followed by its blake3 hash (the new URL: headers; also
+// converts an Archive:-based project to URL:-based). A URL:-based project
+// accepts only URLs.
+int cmd_rebase(const std::string& projeny_arg,
+               const std::vector<std::string>& new_archive_args);
 int cmd_status(const std::string& projeny_arg);
 int cmd_diff_projeny(const std::string& projeny_arg);
 int cmd_diff(const std::string& dir, const std::string& other_dir);
