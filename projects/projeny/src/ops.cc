@@ -37,6 +37,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unistd.h>
 
@@ -754,8 +755,18 @@ std::string journal_path_for(const Ctx& ctx);
 // Stale-renaming either in that window makes the subsequent `projeny setup`
 // die with "archive ... does not exist and neither does its snapshot"
 // instead of recovering, and needs hand-restoration.
+//
+// `url_hashes` (optional) lists the blake3 hashes of the CURRENT .projeny
+// file's own URL: headers. A snapshot that one of them verifies is NOT
+// stale state from a removed checkout — it IS the archive the file
+// records (the bytes a `create` just fetched, or the download a previous
+// setup cached), so it is kept and the fresh setup skips its download.
+// This is the single-project mirror of the multi-project batch rule below:
+// a plan-verified snapshot must survive a workdir-less project's setup or
+// the batch's own download would be destroyed.
 void disregard_stale_state(const Ctx& ctx,
-                           const std::vector<std::string>& archives)
+                           const std::vector<std::string>& archives,
+                           const std::set<std::string>* url_hashes = nullptr)
 {
     if (path_exists(journal_path_for(ctx)))
         return;
@@ -770,7 +781,7 @@ void disregard_stale_state(const Ctx& ctx,
         }
     };
 
-    // Stale one logical file under both of its names: `dotted` is the
+// Stale one logical file under both of its names: `dotted` is the
     // canonical name, `legacy` the pre-dot-naming name. Parallel workers
     // of one multi-project command can stale the same shared file at the
     // same time (several projects using one archive); move_path_shared
@@ -823,6 +834,15 @@ void disregard_stale_state(const Ctx& ctx,
                         blake3_file_hash_hex(snap)) > 0)
                     continue;
             }
+        }
+        // Single-project mirror of the plan rule above: a snapshot the
+        // caller's own .projeny URL: hashes verify stays (see the
+        // url_hashes parameter's comment).
+        if (url_hashes != nullptr) {
+            std::string snap = snapshot_path_for(archive);
+            if (is_readable_file(snap) &&
+                url_hashes->count(blake3_file_hash_hex(snap)) > 0)
+                continue;
         }
         stale_pair(snapshot_path_for(archive),
                    legacy_snapshot_path_for(archive));
@@ -2124,6 +2144,28 @@ std::string rel_to_cwd(const std::string& abs)
     return out;
 }
 
+// Softly parse `raw` as a .projeny file: true with *out filled, false when
+// the bytes are not a usable .projeny file — without printing anything on
+// the common failure shapes. validate_projeny_bytes is silent and rejects
+// exactly the shapes that matter for the callers below (git conflict
+// markers, NUL bytes, missing headers), so a conflicted or garbage file
+// falls back cleanly; parse_bytes runs inside a catch for the remaining
+// malformed-header cases. Callers use this to CHECK a .projeny file they
+// do not own (a workdir sibling, a corner-guard candidate): any failure
+// means "not attributable", never an error report of its own.
+bool try_parse_projeny_softly(const std::string& raw, const std::string& what,
+                              ProjenyFile* out)
+{
+    if (validate_projeny_bytes(raw) != "")
+        return false;
+    try {
+        *out = ProjenyFile::parse_bytes(raw, what);
+    } catch (const ProjenyFatalError&) {
+        return false;
+    }
+    return true;
+}
+
 // Resolve a project argument to a .projeny file path. Accepts either the
 // .projeny file itself or a directory: a directory next to a
 // "<dir>.projeny" sibling names it implicitly (the workdir rule — this is
@@ -2135,6 +2177,18 @@ std::string rel_to_cwd(const std::string& abs)
 // unchanged so the caller's own error reports it — including a missing
 // "*.projeny" path, whose read failure carries recovery guidance no generic
 // resolver error can improve on. Dies otherwise.
+//
+// The workdir-sibling rule carries one validation: the workdir is always
+// named by the Name: header, so the sibling must actually claim THIS
+// directory — its parsed Name: must equal the directory's basename. A
+// directory sitting next to a "<dir>.projeny" whose Name: differs is NOT
+// that project's checkout (it just happens to share the file's stem), and
+// resolving into it would let a command read or destroy the wrong
+// project's state; that mismatch is a hard error. The sibling is parsed
+// SOFTLY (see try_parse_projeny_softly): a file that cannot be parsed
+// keeps the historical behavior — git-conflicted .projeny recovery via
+// `setup` depends on resolving the directory and then hitting setup's own
+// recovery path, not on a resolver refusal.
 //
 // Arguments that exist on disk are resolved PHYSICALLY first, on the raw
 // (trailing-slash-stripped) spelling, BEFORE lexical normalization:
@@ -2164,13 +2218,28 @@ std::string resolve_projeny_path(const std::string& arg, const char* cmd)
         if (is_dir(phys)) {
             // Workdir-sibling rule, checked BEFORE the scan: a directory
             // sitting next to a "<dir>.projeny" file IS that project's
-            // workdir. This is what makes '.' and '..' resolve, and it wins
+            // workdir — but only when the file says so: its Name: header
+            // must name this directory (the checkout is always named by
+            // Name:). This is what makes '.' and '..' resolve, and it wins
             // even when the directory happens to hold stray .projeny files
             // of its own.
+            std::string sib_base = basename_of(phys);
             std::string sib_abs = join_path(dirname_of(phys),
-                                            basename_of(phys) + ".projeny");
-            if (path_exists(sib_abs) && !is_dir(sib_abs))
+                                            sib_base + ".projeny");
+            if (path_exists(sib_abs) && !is_dir(sib_abs)) {
+                std::string raw;
+                ProjenyFile pf;
+                if (try_read_file_bytes(sib_abs, &raw) &&
+                    try_parse_projeny_softly(raw, "'" + spell(sib_abs) + "'",
+                                             &pf) &&
+                    pf.name != sib_base) {
+                    die(std::string("cannot ") + cmd + " '" + arg +
+                        "': '" + spell(sib_abs) +
+                        "' names the checkout directory '" + pf.name +
+                        "', not '" + sib_base + "'");
+                }
                 return spell(sib_abs);
+            }
             std::vector<std::string> cands;
             for (const std::string& n : list_dir_names(phys)) {
                 if (ends_with(n, ".projeny"))
@@ -2410,7 +2479,14 @@ int setup_impl(const Ctx& ctx)
                     stale_archives.push_back(old_archive);
             }
         }
-        disregard_stale_state(ctx, stale_archives);
+        // A URL: project's snapshot that the file's own hashes verify is
+        // the archive this very setup wants (e.g. the bytes `create` just
+        // wrote): keep it so the fresh setup below downloads nothing.
+        std::set<std::string> url_hashes;
+        for (const ProjenyUrl& u : cur.urls)
+            url_hashes.insert(u.hash);
+        disregard_stale_state(ctx, stale_archives,
+                              url_hashes.empty() ? nullptr : &url_hashes);
         do_fresh_setup(ctx, cur);
         StatusData sd;
         sd.status = "setup";
@@ -3070,55 +3146,159 @@ void replay_pending_ops(const StatusData& st, const std::string& workdir,
         remove_recursive(join_path(root, r));
 }
 
+namespace {
+
+// The new-archive argument grammar shared by `rebase` and `create`: the
+// FIRST argument decides the mode. A string curl's URL parser accepts (see
+// arg_is_url) starts a URL: header list — one or more <url> [<blake3-hash>]
+// pairs. Anything else is the legacy form: exactly one local tarball path.
+// Every message words the command's own name, so rebase and create refuse
+// identical shapes identically.
+void parse_archive_args(const std::vector<std::string>& archive_args,
+                        std::vector<ProjenyUrl>* urls, std::string* tarball,
+                        const char* cmd)
+{
+    urls->clear();
+    tarball->clear();
+    bool url_mode = !archive_args.empty() && arg_is_url(archive_args[0]);
+    if (!url_mode) {
+        if (archive_args.size() != 1)
+            die(std::string(cmd) +
+                " takes exactly one new tarball path (or URL(s): 'projeny " +
+                cmd + " " +
+                (std::string(cmd) == "create" ? "<f.projeny>"
+                                              : "<f.projeny|dir>") +
+                " <url> [<blake3-hash>] [<url> [<blake3-hash>]...])");
+        *tarball = archive_args[0];
+        return;
+    }
+    for (size_t i = 0; i < archive_args.size(); ++i) {
+        const std::string& a = archive_args[i];
+        // The first argument's URL-ness is already settled — it chose
+        // URL mode above — so only the later arguments pay for a parse.
+        if (i == 0 || arg_is_url(a)) {
+            ProjenyUrl u;
+            u.url = a;
+            urls->push_back(u);
+            continue;
+        }
+        // A non-URL argument is the blake3 hash of the URL before it:
+        // the same 64-hex rule a .projeny file's "URL: <url> <hash>"
+        // header and `projeny download` apply, normalized to lowercase.
+        if (urls->empty() || !urls->back().hash.empty())
+            die(std::string(cmd) +
+                " URL arguments come as <url> [<blake3-hash>] pairs; '" + a +
+                "' does not follow a hash-less URL");
+        std::string lower;
+        bool ok = a.size() == 64;
+        for (char c : a) {
+            if (!isxdigit(static_cast<unsigned char>(c)))
+                ok = false;
+            lower.push_back(
+                static_cast<char>(tolower(static_cast<unsigned char>(c))));
+        }
+        if (!ok)
+            die("invalid blake3 hash '" + a + "' for " + urls->back().url);
+        urls->back().hash = lower;
+    }
+}
+
+// Download and verify EVERY listed URL argument (the parse_archive_args
+// URL form), shared by rebase and create: each distinct URL downloads
+// once, a hashless URL's hash is computed from its download and reported,
+// an asserted hash that mismatches is a hard error, and a hashed URL that
+// fails to download only warns (the mirror stays listed). On return every
+// entry carries a hash, *verified_data holds the FIRST verified download's
+// bytes, and *new_base is the first URL's archive basename (a URL that
+// does not name a file dies here, mirroring the .projeny parse's rule).
+// Every message is byte-identical to the inline loop this extracted, which
+// the test suite asserts.
+void verify_urls(std::vector<ProjenyUrl>* urls, std::string* verified_data,
+                 std::string* new_base, const char* cmd,
+                 const std::string& what)
+{
+    *new_base = archive_name_from_url((*urls)[0].url);
+    if (new_base->empty())
+        die("URL '" + (*urls)[0].url + "' does not name a file");
+    std::map<std::string, std::pair<bool, std::string>> fetched;
+    bool have_verified = false;
+    for (ProjenyUrl& u : *urls) {
+        bool ok;
+        std::string data, err;
+        auto it = fetched.find(u.url);
+        if (it == fetched.end()) {
+            // try_download announces the attempt itself ("projeny:
+            // downloading '<url>'", then '\r'-terminated progress).
+            ok = try_download(u.url, &data, &err);
+            fetched[u.url] = {ok, ok ? data : err};
+        } else {
+            ok = it->second.first;
+            if (ok)
+                data = it->second.second;
+            else
+                err = it->second.second;
+        }
+        if (!ok) {
+            if (u.hash.empty())
+                // Without a hash there is nothing to record: a URL:
+                // header always carries one, so this is a hard error.
+                die("cannot compute the blake3 hash of '" + u.url +
+                    "': " + err +
+                    "; pass the hash explicitly after the URL "
+                    "('projeny hash <file>' computes it) — a URL: "
+                    "header always carries a hash");
+            // A hashed mirror that fails to download only warns: the
+            // line stays listed in the .projeny file, and a later
+            // setup falls through it exactly the same way.
+            warn("could not download '" + u.url + "': " + err +
+                 "; trying the next URL");
+            continue;
+        }
+        std::string have = blake3_hash_hex(data);
+        if (!u.hash.empty() && have != u.hash)
+            // The user asserted this hash: a mismatch is a hard error,
+            // not a mirror fall-through — a bad pair must not be
+            // silently written into the file.
+            die("downloaded '" + u.url + "' but its blake3 hash is " +
+                have + ", expected " + u.hash +
+                "; the hash was given explicitly, so projeny stops "
+                "instead of writing a mismatched URL: header");
+        if (u.hash.empty()) {
+            u.hash = have;
+            note("computed blake3 hash " + have + " for '" + u.url + "'");
+        }
+        if (!have_verified) {
+            // The FIRST verified entry's bytes are the new tarball
+            // (the snapshot is named after the first URL regardless).
+            have_verified = true;
+            *verified_data = data;
+        }
+    }
+    if (!have_verified) {
+        // The refusal words the command's own action: "not rebasing"
+        // for rebase, "not creating" for create (the gerund of both
+        // command names drops a trailing 'e').
+        std::string doing = cmd;
+        if (!doing.empty() && doing.back() == 'e')
+            doing.pop_back();
+        doing += "ing";
+        die("no URL argument produced a verified download; not " + doing +
+            " '" + what + "' (nothing was changed)");
+    }
+}
+
+} // namespace
+
 int cmd_rebase(const std::string& projeny_arg,
                const std::vector<std::string>& new_archive_args)
 {
-    // Argument parsing, before anything is touched: the FIRST argument
-    // decides the mode. A string curl's URL parser accepts (see arg_is_url)
-    // starts a URL: header list — one or more <url> [<blake3-hash>] pairs,
-    // which rebases the project onto those URLs (and converts an
-    // Archive:-based project to URL:-based). Anything else is the legacy
-    // form: exactly one local tarball path.
-    bool url_mode =
-        !new_archive_args.empty() && arg_is_url(new_archive_args[0]);
+    // Argument parsing, before anything is touched: see
+    // parse_archive_args — the FIRST argument decides the mode, URL list
+    // or exactly one local tarball path.
     std::vector<ProjenyUrl> urls;
     std::string new_tarball;
-    if (!url_mode) {
-        if (new_archive_args.size() != 1)
-            die("rebase takes exactly one new tarball path (or URL(s): "
-                "'projeny rebase <f.projeny|dir> <url> [<blake3-hash>] "
-                "[<url> [<blake3-hash>]...])");
-        new_tarball = new_archive_args[0];
-    } else {
-        for (size_t i = 0; i < new_archive_args.size(); ++i) {
-            const std::string& a = new_archive_args[i];
-            // The first argument's URL-ness is already settled — it chose
-            // URL mode above — so only the later arguments pay for a parse.
-            if (i == 0 || arg_is_url(a)) {
-                ProjenyUrl u;
-                u.url = a;
-                urls.push_back(u);
-                continue;
-            }
-            // A non-URL argument is the blake3 hash of the URL before it:
-            // the same 64-hex rule a .projeny file's "URL: <url> <hash>"
-            // header and `projeny download` apply, normalized to lowercase.
-            if (urls.empty() || !urls.back().hash.empty())
-                die("rebase URL arguments come as <url> [<blake3-hash>] "
-                    "pairs; '" + a + "' does not follow a hash-less URL");
-            std::string lower;
-            bool ok = a.size() == 64;
-            for (char c : a) {
-                if (!isxdigit(static_cast<unsigned char>(c)))
-                    ok = false;
-                lower.push_back(static_cast<char>(
-                    tolower(static_cast<unsigned char>(c))));
-            }
-            if (!ok)
-                die("invalid blake3 hash '" + a + "' for " + urls.back().url);
-            urls.back().hash = lower;
-        }
-    }
+    parse_archive_args(new_archive_args, &urls, &new_tarball, "rebase");
+    bool url_mode = !urls.empty();
 
     // Absolutize up front: this command replaces the workdir, which can
     // delete the directory the process's CWD sits in (`projeny rebase ..`
@@ -3203,70 +3383,10 @@ int cmd_rebase(const std::string& projeny_arg,
     if (url_mode) {
         // URL mode: download+verify EVERY listed URL before anything is
         // written, so a hard error below leaves the .projeny file, the
-        // status file, the snapshot, and the workdir untouched. Each
-        // distinct URL downloads once. Every entry must end up verified:
-        // a hashed one verifies without changing anything, a hashless one
-        // gets its hash computed (and its bytes may become the archive).
-        new_base = archive_name_from_url(urls[0].url);
-        if (new_base.empty())
-            die("URL '" + urls[0].url + "' does not name a file");
-        std::map<std::string, std::pair<bool, std::string>> fetched;
-        bool have_verified = false;
-        for (ProjenyUrl& u : urls) {
-            bool ok;
-            std::string data, err;
-            auto it = fetched.find(u.url);
-            if (it == fetched.end()) {
-                // try_download announces the attempt itself ("projeny:
-                // downloading '<url>'", then '\r'-terminated progress).
-                ok = try_download(u.url, &data, &err);
-                fetched[u.url] = {ok, ok ? data : err};
-            } else {
-                ok = it->second.first;
-                if (ok)
-                    data = it->second.second;
-                else
-                    err = it->second.second;
-            }
-            if (!ok) {
-                if (u.hash.empty())
-                    // Without a hash there is nothing to record: a URL:
-                    // header always carries one, so this is a hard error.
-                    die("cannot compute the blake3 hash of '" + u.url +
-                        "': " + err +
-                        "; pass the hash explicitly after the URL "
-                        "('projeny hash <file>' computes it) — a URL: "
-                        "header always carries a hash");
-                // A hashed mirror that fails to download only warns: the
-                // line stays listed in the .projeny file, and a later
-                // setup falls through it exactly the same way.
-                warn("could not download '" + u.url + "': " + err +
-                     "; trying the next URL");
-                continue;
-            }
-            std::string have = blake3_hash_hex(data);
-            if (!u.hash.empty() && have != u.hash)
-                // The user asserted this hash: a mismatch is a hard error,
-                // not a mirror fall-through — a bad pair must not be
-                // silently written into the file.
-                die("downloaded '" + u.url + "' but its blake3 hash is " +
-                    have + ", expected " + u.hash +
-                    "; the hash was given explicitly, so projeny stops "
-                    "instead of writing a mismatched URL: header");
-            if (u.hash.empty()) {
-                u.hash = have;
-                note("computed blake3 hash " + have + " for '" + u.url + "'");
-            }
-            if (!have_verified) {
-                // The FIRST verified entry's bytes are the new tarball
-                // (the snapshot is named after the first URL regardless).
-                have_verified = true;
-                verified_data = data;
-            }
-        }
-        if (!have_verified)
-            die("no URL argument produced a verified download; not rebasing '" +
-                ctx.projeny_arg + "' (nothing was changed)");
+        // status file, the snapshot, and the workdir untouched (see
+        // verify_urls for the exact per-URL semantics).
+        verify_urls(&urls, &verified_data, &new_base, "rebase",
+                    ctx.projeny_arg);
         // The verified bytes become the rebase's working archive as a scratch
         // file in tURL — deliberately NOT the snapshot: the snapshot is the
         // checkout's only local copy of the base the .projeny file still
@@ -5034,6 +5154,154 @@ void assess_erase_check(const ErasePlan& p, const std::string& abs,
         out->changes.push_back("disappeared: '" + d + "'");
 }
 
+// Build one project's erase plan from its (absolutized) .projeny path:
+// read + parse the file, validate its Name: header, and fill in every path
+// the erase deletes. On failure *error carries the canonical error text and
+// the returned plan is empty (the caller refuses the project with it —
+// die() has already printed the canonical report once, unlabeled, so the
+// per-project reporting can reproduce it under the label).
+ErasePlan make_erase_plan(const std::string& abs_file, bool erase_snapshots,
+                          std::string* error)
+{
+    ErasePlan p;
+    error->clear();
+    std::string raw;
+    if (!try_read_file_bytes(abs_file, &raw)) {
+        p.error = "cannot read '" + abs_file +
+                  "' (missing?); refusing to erase anything for it (the "
+                  ".projeny file names what would be deleted)";
+        *error = p.error;
+        return p;
+    }
+    ProjenyFile pf;
+    try {
+        pf = ProjenyFile::parse_bytes(raw, "'" + abs_file + "'");
+    } catch (const ProjenyFatalError& e) {
+        // die() already printed the canonical report (unlabeled, like
+        // the other parallel commands' planning phase); the per-project
+        // task reproduces it under the label.
+        p.error = e.message();
+        *error = p.error;
+        return p;
+    }
+    // Belt-and-suspenders (parse_bytes already rejects every one of
+    // these with "bad Name: header"): never let a Name: that does not
+    // name a single directory inside pdir turn into a deletion.
+    if (pf.name.empty() || pf.name == "." || pf.name == ".." ||
+        pf.name.find('/') != std::string::npos) {
+        p.error = "cannot erase '" + abs_file +
+                  "': its Name: header does not name a checkout "
+                  "directory; refusing to delete anything";
+        *error = p.error;
+        return p;
+    }
+    std::string pdir = dirname_of(abs_file);
+    p.name = pf.name;
+    p.workdir = join_path(pdir, pf.name);
+    p.status = dotname(abs_file) + ".status";
+    p.legacy_status = abs_file + ".status";
+    p.journal = abs_file + ".setup-journal";
+    if (erase_snapshots) {
+        // The exact snapshot the next setup would use: for a URL
+        // project url_snapshot_path's dotted form, for a classic one
+        // snapshot_path_for(pdir/<archive>) — the same formula, since
+        // url_snapshot_path is snapshot_path_for(join_path(pdir,
+        // pf.archive)). The checked-in archive tarball itself
+        // (pdir/<archive>) is never touched, and neither is any
+        // similarly named snapshot for a different version.
+        std::string archive = join_path(pdir, pf.archive);
+        p.snapshot = snapshot_path_for(archive);
+        p.legacy_snapshot = legacy_snapshot_path_for(archive);
+    }
+    return p;
+}
+
+// The single-project erase-setup core, shared with `create` (--force over
+// an existing .projeny file, and the --origname corner guard's attributed
+// sibling): build the plan, run the no-force check when force_level < 2
+// (refusing with erase-setup's own wording — a dirty or uncheckable
+// project erases nothing), and erase. force_level >= 2 skips the check,
+// exactly like `erase-setup --force`. `cmd` names the calling command; the
+// wording is erase-setup's own either way, so it is only carried for
+// future diagnostics.
+void erase_project_state(const std::string& abs_file, bool erase_snapshots,
+                         int force_level, const char* cmd)
+{
+    (void)cmd;
+    std::string error;
+    ErasePlan p = make_erase_plan(abs_file, erase_snapshots, &error);
+    std::string label = basename_of(abs_file);
+
+    if (force_level < 2) {
+        // A project whose .projeny cannot be read or parsed cannot be
+        // assessed at all — refuse before any check runs, with the same
+        // whole-invocation refusal one project's erase-setup prints.
+        if (!error.empty())
+            die("cannot check 1 of 1 project(s) for uncommitted changes; "
+                "refusing to erase anything (use --force to erase anyway)",
+                bullet_list({("'" + label + "': " + error)}));
+        // The check: one labeled worker's worth of assess_erase_check, run
+        // inline (there is exactly one project). A check that dies records
+        // the failure instead of escaping: the refusal below names the
+        // project again, exactly as the parallel form's does.
+        EraseCheck check;
+        set_output_label(label);
+        try {
+            assess_erase_check(p, abs_file, &check);
+        } catch (const ProjenyFatalError& e) {
+            check.failed = true;
+            check.error = e.message();
+        }
+        set_output_label("");
+        if (check.failed)
+            die("cannot check 1 of 1 project(s) for uncommitted changes; "
+                "refusing to erase anything (use --force to erase anyway)",
+                bullet_list({("'" + label + "': " + check.error)}));
+        if (check.dirty) {
+            std::string line = "'" + label + "': ";
+            for (size_t k = 0; k < check.changes.size(); ++k) {
+                if (k > 0)
+                    line += "; ";
+                line += check.changes[k];
+            }
+            die("refusing to erase 1 of 1 project(s) with uncommitted "
+                "changes (use --force to erase anyway)",
+                bullet_list({line}));
+        }
+    } else if (!error.empty()) {
+        // With --force the per-project phase dies under the label (the
+        // canonical report already printed once, unlabeled, during the
+        // planning above).
+        set_output_label(label);
+        try {
+            die(error);
+        } catch (...) {
+            set_output_label("");
+            throw;
+        }
+    }
+
+    // The erase itself, labeled like the per-project phase: its warnings,
+    // errors, and notes name the project.
+    int rc = 0;
+    set_output_label(label);
+    try {
+        rc = erase_one_project(p);
+    } catch (const ProjenyFatalError&) {
+        rc = 1;
+    }
+    set_output_label("");
+    if (rc != 0) {
+        // A deletion failed: erase-setup's own summary line, then stop —
+        // a half-erased project is no base to create on top of. The
+        // thrown message is never printed (die() printed the per-path
+        // errors already); main() turns it into exit status 1.
+        fprintf(stderr, "projeny: 1 of 1 erase-setup(s) failed: %s\n",
+                label.c_str());
+        throw ProjenyFatalError("erase-setup failed");
+    }
+}
+
 } // namespace
 
 int cmd_erase_setup_multi(const std::vector<std::string>& projeny_args,
@@ -5055,62 +5323,18 @@ int cmd_erase_setup_multi(const std::vector<std::string>& projeny_args,
         projects.push_back({a, abs});
     }
 
-    // 2. Parse every unique .projeny on the main thread: the Name: header
-    // names the checkout to delete and, with --erase-snapshots, the
-    // Archive:/URL archive names the snapshot. A file that cannot be read
-    // or parsed fails its own project — the per-project task reports the
-    // canonical error under the project's label — and the other projects
-    // still erase.
+    // 2. Parse every unique .projeny on the main thread (make_erase_plan):
+    // the Name: header names the checkout to delete and, with
+    // --erase-snapshots, the Archive:/URL archive names the snapshot. A
+    // file that cannot be read or parsed fails its own project — the
+    // per-project task reports the canonical error under the project's
+    // label — and the other projects still erase.
     std::vector<ErasePlan> plans(projects.size());
     std::vector<std::string> labels(projects.size());
     for (size_t i = 0; i < projects.size(); ++i) {
-        ErasePlan& p = plans[i];
         labels[i] = basename_of(projects[i].abs);
-        std::string raw;
-        if (!try_read_file_bytes(projects[i].abs, &raw)) {
-            p.error = "cannot read '" + projects[i].abs +
-                      "' (missing?); refusing to erase anything for it (the "
-                      ".projeny file names what would be deleted)";
-            continue;
-        }
-        ProjenyFile pf;
-        try {
-            pf = ProjenyFile::parse_bytes(raw, "'" + projects[i].abs + "'");
-        } catch (const ProjenyFatalError& e) {
-            // die() already printed the canonical report (unlabeled, like
-            // the other parallel commands' planning phase); the per-project
-            // task reproduces it under the label.
-            p.error = e.message();
-            continue;
-        }
-        // Belt-and-suspenders (parse_bytes already rejects every one of
-        // these with "bad Name: header"): never let a Name: that does not
-        // name a single directory inside pdir turn into a deletion.
-        if (pf.name.empty() || pf.name == "." || pf.name == ".." ||
-            pf.name.find('/') != std::string::npos) {
-            p.error = "cannot erase '" + projects[i].abs +
-                      "': its Name: header does not name a checkout "
-                      "directory; refusing to delete anything";
-            continue;
-        }
-        std::string pdir = dirname_of(projects[i].abs);
-        p.name = pf.name;
-        p.workdir = join_path(pdir, pf.name);
-        p.status = dotname(projects[i].abs) + ".status";
-        p.legacy_status = projects[i].abs + ".status";
-        p.journal = projects[i].abs + ".setup-journal";
-        if (erase_snapshots) {
-            // The exact snapshot the next setup would use: for a URL
-            // project url_snapshot_path's dotted form, for a classic one
-            // snapshot_path_for(pdir/<archive>) — the same formula, since
-            // url_snapshot_path is snapshot_path_for(join_path(pdir,
-            // pf.archive)). The checked-in archive tarball itself
-            // (pdir/<archive>) is never touched, and neither is any
-            // similarly named snapshot for a different version.
-            std::string archive = join_path(pdir, pf.archive);
-            p.snapshot = snapshot_path_for(archive);
-            p.legacy_snapshot = legacy_snapshot_path_for(archive);
-        }
+        std::string error;
+        plans[i] = make_erase_plan(projects[i].abs, erase_snapshots, &error);
     }
 
     // 3. Check phase (only without --force): assess every project in
@@ -5237,6 +5461,332 @@ int cmd_erase_setup_multi(const std::vector<std::string>& projeny_args,
         fprintf(stderr, "projeny: %zu of %zu erase-setup(s) failed: %s\n",
                 failed, projects.size(), failed_labels.c_str());
     return failed > 0 ? 1 : 0;
+}
+
+// Create a brand-new .projeny file pointing at an archive, then set it up.
+//
+// `file_arg` is the .projeny file to create: it must end in ".projeny" and
+// may carry a directory path (its pdir — the directory that will hold the
+// file, the archive, and the checkout — must exist). The file's stem is the
+// default Name:; `origname_opt` (when given) overrides the checkout name —
+// the file gets Name: <name> AND Origname: <name>, so the checkout
+// directory becomes <pdir>/<name> while the .projeny file stays put.
+// `archive_args` is exactly rebase's grammar (parse_archive_args): either
+// one local tarball path (copied into the pdir, like rebase does) or one or
+// more <url> [<blake3-hash>] pairs (downloaded + verified via verify_urls;
+// the first verified download's bytes become the snapshot). `comment` is
+// the file's prose (--comment; empty when absent). `force_level` counts
+// --force occurrences: 0 refuses to overwrite an existing file; 1 erases
+// the existing project's setup state WITH the no-force check; 2+ erases
+// unconditionally (erase_project_state). With --origname, a pre-existing
+// <pdir>/<name> checkout directory is refused at force 0 and — at force
+// >= 1 — erased only when it is attributable, and attribution consults
+// two sources in order. First the file being replaced: when <f> itself
+// exists, parses, and carries Name: <name>, the directory is ITS checkout
+// — its own erase below cleans it up, so no eviction is armed. Only then
+// is the sibling <pdir>/<name>.projeny consulted (it must exist, parse,
+// and carry Name: <name>), which arms the eviction. On any attribution
+// failure the guard refuses regardless of force level: an unattributable
+// directory is NEVER removed, no matter how many --force flags are given.
+// `erase_snapshots` passes through to every erase. The composed file is
+// parsed back and its fields validated before anything is written. Every
+// fallible read-only step — the archive-argument grammar, the URL
+// downloads (or the tarball's existence check), the Origname inference
+// with its --origname match, and the corner guard's attribution — runs
+// before any erase, so a refusal leaves the replaced project's checkout,
+// status file, and .projeny bytes (and the pdir at large) untouched.
+int cmd_create(const std::string& file_arg,
+               const std::vector<std::string>& archive_args,
+               const std::string& comment,
+               const std::optional<std::string>& origname_opt,
+               int force_level, bool erase_snapshots)
+{
+    // ---- argument validation, before anything is touched ----
+    if (!ends_with(file_arg, ".projeny"))
+        die("'" + file_arg + "' does not end in '.projeny'");
+    std::string base = basename_of(file_arg);
+    std::string stem = base.substr(0, base.size() - strlen(".projeny"));
+    if (stem.empty())
+        die("cannot create '" + file_arg +
+            "': the project name before '.projeny' is empty");
+    if (stem == "." || stem == ".." || stem.find('/') != std::string::npos)
+        die("cannot create '" + file_arg + "': '" + stem +
+            "' is not a valid project name (it must be a plain name: no "
+            "'/', not '.' or '..')");
+    std::string pdir_arg = dirname_of(file_arg);
+    if (!is_dir(pdir_arg))
+        die("'" + pdir_arg + "' does not exist");
+    if (origname_opt &&
+        (origname_opt->empty() || *origname_opt == "." ||
+         *origname_opt == ".." ||
+         origname_opt->find('/') != std::string::npos))
+        die("bad --origname value '" + *origname_opt +
+            "': it must be a plain directory name (no '/', not '.' or "
+            "'..')");
+
+    // The checkout name: --origname names the checkout directory (the
+    // workdir is always named by the Name: header), defaulting to the
+    // .projeny file's stem.
+    std::string name = origname_opt ? *origname_opt : stem;
+
+    // Absolutize up front: the erases below can remove the directory the
+    // process's CWD sits in, and every later path must not need the CWD.
+    std::string f = absolutize(file_arg);
+    std::string pdir = dirname_of(f);
+
+    // ---- the archive grammar: parse it before anything can fail ----
+    // A grammar error (two tarball paths, a hash before any URL, ...) must
+    // die before any erase runs, so an existing project outlives a typo.
+    std::vector<ProjenyUrl> urls;
+    std::string tarball;
+    parse_archive_args(archive_args, &urls, &tarball, "create");
+    bool url_mode = !urls.empty();
+
+    std::string new_base;      // the archive's basename (headers + snapshot)
+    std::string verified_data; // URL mode: the verified tarball's bytes
+    std::string archive_path;  // where the archive bytes live right now
+    // URL mode's scratch home for the verified bytes: the archive is
+    // inspected (and Origname inferred) BEFORE anything is written into
+    // the pdir, so a refusal here leaves nothing behind.
+    TempDir tURL(system_scratch_parent(), "projeny-create-url-");
+
+    // ---- the fallible read-only phase ----
+    // Everything from here through the corner guard below can refuse, and
+    // none of it writes anything the caller would miss: only after ALL of
+    // it passed do the erases (and the tarball copy) run. A plain refusal
+    // dies before the download, so no bandwidth is wasted on it; a failed
+    // download or a missing tarball dies before anything is erased, so
+    // verify_urls' "(nothing was changed)" is literally true.
+    if (path_exists(f) && force_level == 0)
+        die("cannot create '" + f +
+            "': it already exists (pass --force to overwrite it and "
+            "erase its setup state; pass --force twice to erase "
+            "unconditionally)");
+
+    if (url_mode) {
+        // Download+verify every URL BEFORE any erase: a failed download
+        // must leave the replaced project's checkout, status file, and
+        // .projeny file untouched.
+        verify_urls(&urls, &verified_data, &new_base, "create", f);
+        archive_path = join_path(tURL.path, new_base);
+        write_file_bytes(archive_path, verified_data);
+    } else {
+        if (!path_exists(tarball))
+            die("tarball '" + tarball + "' does not exist");
+        new_base = basename_of(tarball);
+        if (new_base.empty() || new_base.find('/') != std::string::npos)
+            die("bad tarball path '" + tarball + "'");
+        // The SOURCE tarball is the Origname source (archive_single_top_name
+        // only reads it); the copy into the pdir waits for the destructive
+        // phase below.
+        archive_path = tarball;
+    }
+
+    std::string origname = archive_single_top_name(archive_path);
+    if (origname_opt && *origname_opt != origname)
+        die("the archive '" + (url_mode ? urls[0].url : tarball) +
+            "' unpacks to '" + origname + "', not '" + *origname_opt +
+            "' (setup requires them to match)");
+
+    // ---- the --origname corner guard: checked read-only here, fired below ----
+    // With --origname, a pre-existing <pdir>/<name> directory would be
+    // clobbered by the checkout this command is about to create. At force
+    // 0 that is a refusal. At force >= 1 the directory is erased ONLY when
+    // it is attributable, and attribution consults two sources in order.
+    // First the file being replaced: when <f> itself exists, softly parses,
+    // and carries Name: <name>, the directory is ITS checkout — the
+    // existing-file erase below removes <name>/ (and its status file), so
+    // no eviction is armed and the guard has nothing left to do. Only when
+    // <f> is no valid attribution source (missing, unparseable, or its
+    // Name: differs) is the sibling <pdir>/<name>.projeny consulted: it
+    // must exist (a plain file), parse cleanly, and carry Name: <name> —
+    // that is what makes the directory that project's checkout (the same
+    // rule resolve_projeny_path applies) — and arms the eviction below. On
+    // ANY attribution failure the guard refuses regardless of force level:
+    // --force --force never blind-rm's an unattributable directory
+    // (erase-setup --force also only erases named projects). The check
+    // runs BEFORE any erase; the eviction erase itself waits for the
+    // destructive phase below.
+    std::string guard_sib; // non-empty: the attributable sibling to evict
+    if (origname_opt) {
+        std::string workdir = join_path(pdir, name);
+        if (path_exists(workdir)) {
+            if (force_level == 0)
+                die("cannot create '" + f + "': the checkout directory '" +
+                    name + "' already exists at '" + workdir +
+                    "'; remove it, or pass --force to erase the setup "
+                    "state of the project that owns it");
+            std::string sib = join_path(pdir, name + ".projeny");
+            bool attributable = false;
+            std::string raw;
+            ProjenyFile cand_pf;
+            // Source 1: the file being replaced. An <f> that softly parses
+            // and carries Name: <name> owns the checkout; its erase below
+            // cleans it up, so the guard stays unarmed.
+            if (!is_dir(f) && try_read_file_bytes(f, &raw))
+                attributable =
+                    try_parse_projeny_softly(raw, "'" + f + "'", &cand_pf) &&
+                    cand_pf.name == name;
+            // Source 2: the sibling <pdir>/<name>.projeny (the same rule
+            // resolve_projeny_path applies), consulted only when <f> did
+            // not attribute the directory.
+            if (!attributable) {
+                if (!is_dir(sib) && try_read_file_bytes(sib, &raw))
+                    attributable =
+                        try_parse_projeny_softly(raw, "'" + sib + "'",
+                                                 &cand_pf) &&
+                        cand_pf.name == name;
+                if (attributable)
+                    guard_sib = sib;
+            }
+            if (!attributable)
+                die("cannot create '" + f + "': '" + workdir +
+                    "' exists but is not the checkout of '" + sib +
+                    "' (or there is no such file); refusing to remove it");
+        }
+    }
+
+    // ---- the destructive phase: every fallible check has passed ----
+    if (path_exists(f))
+        erase_project_state(f, erase_snapshots, force_level, "create");
+
+    // Guard eviction: only the sibling-attributed path arms this (an <f>
+    // that owned <name>/ attributed the directory to itself above and left
+    // the guard unarmed; the erase above is what cleans its checkout up).
+    // The re-check keeps the eviction honest: only when <name>/ still
+    // stands does the remembered, attributable project's setup state go.
+    if (!guard_sib.empty() && path_exists(join_path(pdir, name)))
+        erase_project_state(guard_sib, erase_snapshots, force_level,
+                            "create");
+
+    // A leftover .projeny file that still claims the checkout name:
+    // projeny never deletes .projeny files, so an evicted project's file
+    // survives the guard's erase (and any earlier erase leaves a competing
+    // sibling alone too) — it still carries Name: <name>, so both it and
+    // the file this command is about to write claim <pdir>/<name> while
+    // only the new one owns it. Warn loudly, naming the leftover and the
+    // fix; never delete or modify the file.
+    if (origname_opt) {
+        std::string sib = join_path(pdir, name + ".projeny");
+        if (sib != f && !is_dir(sib)) {
+            std::string raw;
+            ProjenyFile sib_pf;
+            if (try_read_file_bytes(sib, &raw) &&
+                try_parse_projeny_softly(raw, "'" + sib + "'", &sib_pf) &&
+                sib_pf.name == name)
+                warn("'" + sib + "' still names the checkout directory '" +
+                     name + "', which now belongs to '" + f +
+                     "'; remove or rename '" + sib +
+                     "' if it is no longer wanted");
+        }
+    }
+
+    // ---- tarball mode: copy the source into the pdir, after the erases ----
+    if (!url_mode) {
+        std::string dest_archive = join_path(pdir, new_base);
+        std::string new_abs = absolutize(tarball);
+        std::string dest_abs = absolutize(dest_archive);
+        // Copy the tarball into the pdir if it isn't already there. When
+        // the tarball's basename matches the replaced project's Archive
+        // but its bytes differ, warn (content changed under a familiar
+        // name) and continue with the new file — never silently keep the
+        // old bytes. (The replaced file — if any — still holds its old
+        // headers at this point; only its setup state was erased above.)
+        std::string old_archive;
+        std::string raw;
+        ProjenyFile old_pf;
+        if (path_exists(f) && try_read_file_bytes(f, &raw) &&
+            try_parse_projeny_softly(raw, "'" + f + "'", &old_pf))
+            old_archive = old_pf.archive;
+        if (new_base == old_archive && path_exists(dest_archive) &&
+            new_abs != dest_abs) {
+            if (file_hash_hex(tarball) != file_hash_hex(dest_archive) ||
+                file_size_bytes(tarball) != file_size_bytes(dest_archive))
+                warn("tarball '" + new_base + "' differs from the current '" +
+                     old_archive + "'; using the new file");
+        }
+        if (new_abs != dest_abs)
+            copy_file_bytes(tarball, dest_archive);
+    }
+
+    // ---- compose the file ----
+    // Header block in the conventional order: the archive-location lines
+    // (URL: per mirror, or Archive:), then Origname:, then Name: — the
+    // shape every tool-written .projeny file uses.
+    ProjenyFile pf;
+    std::string head;
+    if (url_mode) {
+        for (const ProjenyUrl& u : urls)
+            head += "URL: " + u.url + " " + u.hash + "\n";
+    } else {
+        head += "Archive: " + new_base + "\n";
+    }
+    head += "Origname: " + origname + "\n";
+    head += "Name: " + name + "\n";
+    pf.head = head;
+    if (!comment.empty()) {
+        // Indent the prose like every tool-written .projeny file's free
+        // text (rebuild keeps pre-indented lines verbatim;
+        // normalize_prose_indent would otherwise guarantee only a single
+        // leading space). Empty lines stay empty.
+        std::string mid;
+        size_t i = 0;
+        while (i < comment.size()) {
+            size_t j = comment.find('\n', i);
+            if (j == std::string::npos)
+                j = comment.size();
+            std::string line = comment.substr(i, j - i);
+            if (!line.empty())
+                mid += "    ";
+            mid += line;
+            mid += "\n";
+            i = j + 1;
+        }
+        pf.middle = mid;
+    }
+    pf.rebuild("");
+
+    // Self-check: parse the composed bytes back and require every field to
+    // round-trip before anything is written — a cheap guard against
+    // composition bugs.
+    {
+        ProjenyFile check = ProjenyFile::parse_bytes(pf.raw, "'" + f + "'");
+        bool ok = check.name == name && check.origname == origname &&
+                  check.archive == new_base &&
+                  check.urls.size() == urls.size();
+        for (size_t i = 0; url_mode && ok && i < urls.size(); ++i)
+            ok = check.urls[i].url == urls[i].url &&
+                 check.urls[i].hash == urls[i].hash;
+        if (!ok)
+            die("internal: the composed .projeny file for '" + f +
+                "' does not round-trip; refusing to write it");
+    }
+
+    write_file_bytes(f, pf.raw);
+
+    // NOW the URL snapshot: the .projeny file is in place, so the snapshot
+    // name derived from the first URL's basename is exactly what the
+    // file's parse will derive, and setup (called below) finds the archive
+    // already cached — it downloads nothing.
+    if (url_mode)
+        write_file_bytes(snapshot_path_for(join_path(pdir, new_base)),
+                         verified_data);
+
+    if (url_mode)
+        printf("projeny: created '%s' (Name: '%s', Origname: '%s', archive "
+               "'%s' from '%s')\n",
+               f.c_str(), name.c_str(), origname.c_str(), new_base.c_str(),
+               urls[0].url.c_str());
+    else
+        printf("projeny: created '%s' (Name: '%s', Origname: '%s', archive "
+               "'%s')\n",
+               f.c_str(), name.c_str(), origname.c_str(), new_base.c_str());
+
+    // The setup this command promises: a fresh checkout plus status file
+    // (create just erased whatever setup state stood here), or setup's own
+    // adopt-or-refuse rule for a pre-existing workdir the corner guard did
+    // not attribute to anyone.
+    return cmd_setup(f);
 }
 
 // Download URL HASH pairs into the current directory, as one parallel batch
@@ -5676,6 +6226,9 @@ int cmd_help(const std::string& arg0)
            "  rebase <f.projeny|dir> <tarball> point the project at a new tarball\n"
            "  rebase <f.projeny|dir> <url> [<hash>]...\n"
            "                                   ...or at new URL: header(s)\n"
+           "  create <f.projeny> <tarball>     make a new .projeny file and set it up\n"
+           "  create <f.projeny> <url> [<hash>]...\n"
+           "                                   ...or from new URL: header(s)\n"
            "  status <f.projeny|dir>           show setup/conflict/pending state\n"
            "  diff <f.projeny|dir>             print a checkout's uncommitted diff\n"
            "  diff <dir> <other-dir>           print the diff between two trees\n"
@@ -5701,6 +6254,8 @@ int cmd_help(const std::string& arg0)
            "-c[--curl-jobs] N\n"
            "  options for erase-setup: -j[--jobs] N, --erase-snapshots, "
            "--force\n"
+           "  options for create: --comment TEXT, --origname NAME,\n"
+           "                      --force, --erase-snapshots\n"
            "  setup/package/extract/erase-setup take several projects (parallel);\n"
            "  download takes <url> <hash> pairs.\n"
            "\n"
@@ -5708,7 +6263,12 @@ int cmd_help(const std::string& arg0)
            "workdir or another directory holding exactly one .projeny file, or\n"
            "a path whose '<arg>.projeny' sibling exists — typically a missing\n"
            "checkout directory, or a bare name like 'foo' for 'foo.projeny'.\n"
-           "Relative arguments are lexically normalized first, so from inside\n"
+           "A directory next to a '<dir>.projeny' sibling names it only when\n"
+           "that file's Name: header equals the directory's name (the checkout\n"
+           "is always named by Name:); on mismatch the command refuses, and a\n"
+           "sibling that cannot be parsed keeps the old behavior so a\n"
+           "git-conflicted .projeny still recovers via 'setup'. Relative\n"
+           "arguments are lexically normalized first, so from inside\n"
            "the workdir '.' names the project and, from a workdir\n"
            "subdirectory, '..' does too.\n"
            "\n"
@@ -6018,6 +6578,114 @@ int cmd_help_topic(const std::string& arg0, const std::string& topic)
                "one .projeny file, or a path whose '<arg>.projeny' sibling\n"
                "exists (typically a missing checkout directory, or a bare\n"
                "name like 'fake' for 'fake.projeny').\n",
+               t, t);
+        return 0;
+    }
+    if (topic == "create") {
+        printf("%s create <f.projeny> <new-tarball>\n"
+               "%s create <f.projeny> <url> [<blake3-hash>] "
+               "[<url> [<blake3-hash>]...]\n"
+               "       [--comment <text>] [--origname <name>] [--force]\n"
+               "       [--erase-snapshots]\n"
+               "\n"
+               "Create a brand-new .projeny file naming an archive, then\n"
+               "run `setup` on it: the checkout named by Name: is unpacked\n"
+               "from the archive, the fresh (empty) patch applies, and a\n"
+               "new status file records the setup. Options may appear\n"
+               "anywhere among the arguments.\n"
+               "\n"
+               "The first argument is the .projeny file to create. It must\n"
+               "end in '.projeny' and may carry a directory path (e.g.\n"
+               "projects/foo.projeny): the directory that would hold it\n"
+               "must exist. Its name — the basename minus '.projeny' — is\n"
+               "the default Name: header, so the checkout directory\n"
+               "defaults to <pdir>/<name> next to the new file.\n"
+               "\n"
+               "The rest of the arguments name the archive, with exactly\n"
+               "the grammar `rebase` accepts, decided by the FIRST\n"
+               "argument: a string libcurl's URL parser accepts (http://,\n"
+               "https://, ftp://, ftps://, file://) starts URL mode,\n"
+               "anything else is one local tarball path.\n"
+               "\n"
+               "With one local tarball path, the file gets an Archive:\n"
+               "header and the tarball is copied next to the new .projeny\n"
+               "file — exactly what `rebase` does, including the\n"
+               "warn-and-use-the-new-file behavior when the copy's basename\n"
+               "matches the Archive: of the project this command replaces\n"
+               "with different bytes.\n"
+               "\n"
+               "With URL arguments, the URLs (each optionally followed by\n"
+               "its blake3 hash — the same 64-hex value `projeny hash`\n"
+               "computes, uppercase accepted) become the file's URL:\n"
+               "headers, tried in order by later setups; the project is\n"
+               "born URL:-based (no tarball is checked into git). Every\n"
+               "listed URL is downloaded and verified during the create,\n"
+               "each distinct URL once: an omitted hash is computed from\n"
+               "the download and reported, a provided hash that mismatches\n"
+               "is a hard error, a hashless URL that cannot be downloaded\n"
+               "is a hard error, and a hashed URL that fails to download\n"
+               "only warns (the mirror stays listed). If no URL verifies,\n"
+               "nothing is created. The first verified download's bytes\n"
+               "are written to the snapshot, named after the FIRST URL's\n"
+               "basename — the same derivation the .projeny parse applies\n"
+               "— so the setup below downloads nothing.\n"
+               "\n"
+               "Headers are composed in the conventional order: the\n"
+               "Archive:/URL: lines, then Origname:, then Name:, followed\n"
+               "by the prose. Origname: is inferred from the archive\n"
+               "itself: its single top-level directory (an archive holding\n"
+               "several is a hard error). --origname <name> overrides the\n"
+               "checkout name: the created file gets BOTH Name: <name> AND\n"
+               "Origname: <name> — the workdir is always named by Name:,\n"
+               "so the checkout directory becomes <pdir>/<name> while the\n"
+               ".projeny file stays <f.projeny> — and <name> must match\n"
+               "the archive's top directory (otherwise the create refuses\n"
+               "before anything is written).\n"
+               "\n"
+               "--comment <text> stores <text> as the file's free-text\n"
+               "prose, indented like every tool-written .projeny file's\n"
+               "comments; repeating the option keeps only the last text.\n"
+               "\n"
+               "When <f.projeny> already exists, --force decides what\n"
+               "happens to the project it still names (the erase-setup\n"
+               "semantics; --erase-snapshots passes through to the erase):\n"
+               "\n"
+               "  no --force     refuse: it already exists, nothing is\n"
+               "                 touched\n"
+               "  --force        erase the existing project's setup state,\n"
+               "                 but only after the no-force check passes:\n"
+               "                 a checkout with uncommitted changes or\n"
+               "                 unresolved conflicts refuses\n"
+               "  --force twice  erase unconditionally (uncommitted work\n"
+               "                 is discarded)\n"
+               "\n"
+               "A pre-existing checkout directory named by --origname gets\n"
+               "one more guard: <pdir>/<name> is erased (at --force or\n"
+               "above, at the same force level) only when it is\n"
+               "attributable. The file being replaced is considered\n"
+               "first: when <f.projeny> itself exists, parses cleanly, and\n"
+               "carries Name: <name>, the directory is its checkout and\n"
+               "its own erase (above) removes it. Otherwise the sibling\n"
+               "<pdir>/<name>.projeny must exist, parse cleanly, and\n"
+               "carry Name: <name>, which is what makes the directory its\n"
+               "checkout. A directory that cannot be attributed that way\n"
+               "is NEVER removed, no matter how many --force flags are\n"
+               "given (erase-setup --force also only erases named\n"
+               "projects): the create refuses instead, naming the sibling\n"
+               "it checked. An eviction never deletes the evicted\n"
+               "project's .projeny file (projeny never deletes .projeny\n"
+               "files), so the leftover file still carries Name: <name>\n"
+               "and keeps claiming a checkout directory that now belongs\n"
+               "to the new file: the create prints a warning naming the\n"
+               "leftover and suggesting it be removed or renamed if it is\n"
+               "no longer wanted. Without --origname, a pre-existing\n"
+               "directory named by Name: is left to setup's own\n"
+               "adopt-or-refuse rule.\n"
+               "\n"
+               "The command prints one `created` line naming the file, the\n"
+               "checkout name, the top-level directory, and the archive,\n"
+               "then setup's usual line; the erases print their own\n"
+               "erase-setup notes.\n",
                t, t);
         return 0;
     }
@@ -6448,10 +7116,11 @@ int cmd_help_topic(const std::string& arg0, const std::string& topic)
         printf("%s help [command]\n"
                "\n"
                "With no arguments, list all commands. With a command name\n"
-               "(setup, commit, add, rm, mv, resolve, rebase, status, diff,\n"
-               "patch, package, extract, download, erase-setup, freeze-mtime,\n"
-               "unfreeze-mtime, list-frozen-mtimes, get-attributes, hash,\n"
-               "help), print a detailed explanation of that command.\n",
+               "(setup, commit, add, rm, mv, resolve, rebase, create,\n"
+               "status, diff, patch, package, extract, download,\n"
+               "erase-setup, freeze-mtime, unfreeze-mtime,\n"
+               "list-frozen-mtimes, get-attributes, hash, help), print a\n"
+               "detailed explanation of that command.\n",
                t);
         return 0;
     }
