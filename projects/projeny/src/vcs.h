@@ -201,6 +201,17 @@ std::vector<std::string> vcs_add_paths(const std::string& patch,
 std::vector<std::string> vcs_deleted_paths(const std::string& patch,
                                            const std::string& wid);
 
+// (from, to) workdir-relative path pairs of every rename-shaped block in
+// `patch`: blocks carrying `rename from`/`rename to` headers (projeny's own
+// diff and `git diff -M` alike; already wid-stripped like every other
+// patch path), plus header-less blocks whose ---/+++ sides name two
+// different non-empty paths — exactly the shapes the applier moves. Used
+// by `projeny apply` to record the patch's renames in the status file.
+// Combined-diff blocks, empty sides, and identical sides pair nothing;
+// pairs are deduplicated in patch order.
+std::vector<std::pair<std::string, std::string>> vcs_rename_pairs(
+    const std::string& patch, const std::string& wid);
+
 // Drop pure-add blocks whose new path is not in `keep` (workdir-relative,
 // exact or under-a-kept-dir). Used by commit so untracked files (never
 // committed, never `add`ed) stay out of the patch like git leaves untracked

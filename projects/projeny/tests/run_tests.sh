@@ -17108,6 +17108,510 @@ expect_file_contains "the re-setup checkout holds the tarball's content" \
 run_in "$T308" expect_ok "the re-set-up project is clean" "$PROJENY" \
     status foo.projeny
 
+# ------------------------------------------------------------- apply tests
+#
+# The `apply` sections cover applying a patch file (any git diff or any
+# projeny diff, including `projeny diff` output) inside a checkout on top
+# of its uncommitted changes: content hunks land; adds, deletes, renames,
+# and mode changes are applied to the files and recorded in the status
+# file (Added:/Removed:/Renamed:) so a later commit folds them into the
+# .projeny patch; the conflict flow (exit 1, inline markers, Conflict:
+# marks, resolve + commit); the refuse-when-a-touched-file-is-already-
+# conflicted guarantee (nothing at all is written: the status file stays
+# byte-identical and no file appears); idempotent re-apply (no duplicate
+# marks; a rename chained onto a pending mv stays collapsed onto the
+# original); the error paths (missing status file, empty patch,
+# no-diff-blocks patch, missing patch file, help topic); and the binary
+# add roundtrip (NUL-bearing bytes travel base64, land byte-exact, and
+# are marked added).
+
+# ------------------- 309. apply: a projeny diff onto a fresh checkout
+TAP="$ROOT/t309"
+mkdir -p "$TAP/A" "$TAP/B"
+make_tarballs "$TAP" fake
+write_projeny "$TAP/A" fake 1.0 fake
+write_projeny "$TAP/B" fake 1.0 fake
+cp "$TAP/fake-1.0.tar.gz" "$TAP/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAP/B/"
+run_in "$TAP/A" expect_ok "apply fixture setup A" "$PROJENY" setup fake.projeny
+run_in "$TAP/B" expect_ok "apply fixture setup B" "$PROJENY" setup fake.projeny
+# B edits the bottom region of a.c and exports the checkout's diff.
+printf 'int alpha = 1;\n\nint beta = 1;\n\nint gamma = 1;\n\nint delta = 500;\n' \
+    > "$TAP/B/fake/src/a.c"
+(cd "$TAP/B" && "$PROJENY" diff fake.projeny) > "$TAP/bottom.diff"
+expect_file_contains "the exported patch is a git diff" "$TAP/bottom.diff" \
+    "diff --git "
+run_in "$TAP/A" expect_ok "apply a projeny diff inside a checkout" \
+    "$PROJENY" apply fake.projeny "$TAP/bottom.diff"
+if grep -q 'int delta = 500;' "$TAP/A/fake/src/a.c"; then
+    ok "apply updates the file content"
+else
+    fail "apply updates the file content" "$(cat "$TAP/A/fake/src/a.c")"
+fi
+expect_out "status shows the applied modification" "Modified: src/a.c" \
+    "$PROJENY" status "$TAP/A/fake.projeny"
+
+# ------------------- 310. apply: add/delete/rename/mode + commit roundtrip
+TAD="$ROOT/t310"
+mkdir -p "$TAD/A" "$TAD/B"
+cp "$TAP/fake-1.0.tar.gz" "$TAD/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAD/B/"
+write_projeny "$TAD/A" fake 1.0 fake
+write_projeny "$TAD/B" fake 1.0 fake
+run_in "$TAD/A" expect_ok "adm fixture setup A" "$PROJENY" setup fake.projeny
+run_in "$TAD/B" expect_ok "adm fixture setup B" "$PROJENY" setup fake.projeny
+printf 'a brand new file\n' > "$TAD/B/fake/new.txt"
+run_in "$TAD/B" expect_ok "adm fixture add" "$PROJENY" add fake.projeny \
+    fake/new.txt
+run_in "$TAD/B" expect_ok "adm fixture rm" "$PROJENY" rm fake.projeny \
+    fake/src/b.c
+run_in "$TAD/B" expect_ok "adm fixture mv" "$PROJENY" mv fake.projeny \
+    fake/README fake/docs.txt
+chmod +x "$TAD/B/fake/src/a.c"
+(cd "$TAD/B" && "$PROJENY" diff fake.projeny) > "$TAD/adm.diff"
+run_in "$TAD/A" expect_ok "apply the add/delete/rename/mode patch" \
+    "$PROJENY" apply fake.projeny "$TAD/adm.diff"
+if [ -f "$TAD/A/fake/new.txt" ] && \
+   [ "$(cat "$TAD/A/fake/new.txt")" = "a brand new file" ]; then
+    ok "apply creates the added file"
+else
+    fail "apply creates the added file" "ls: $(ls "$TAD/A/fake" 2>&1)"
+fi
+expect_file_contains "apply marks the add" "$TAD/A/.fake.projeny.status" \
+    "Added: new.txt"
+if [ ! -f "$TAD/A/fake/src/b.c" ]; then
+    ok "apply deletes the removed file"
+else
+    fail "apply deletes the removed file" "src/b.c still exists"
+fi
+expect_file_contains "apply marks the removal" "$TAD/A/.fake.projeny.status" \
+    "Removed: src/b.c"
+if [ -f "$TAD/A/fake/docs.txt" ] && [ ! -f "$TAD/A/fake/README" ]; then
+    ok "apply renames the file"
+else
+    fail "apply renames the file" "ls: $(ls "$TAD/A/fake" 2>&1)"
+fi
+expect_file_contains "apply marks the rename" "$TAD/A/.fake.projeny.status" \
+    "Renamed: README -> docs.txt"
+if [ -x "$TAD/A/fake/src/a.c" ]; then
+    ok "apply sets the exec bit"
+else
+    fail "apply sets the exec bit" "src/a.c is not executable"
+fi
+run_in "$TAD/A" expect_ok "commit after apply" "$PROJENY" commit fake.projeny
+expect_file_contains "the committed patch carries the add" \
+    "$TAD/A/fake.projeny" "new file mode"
+expect_file_contains "the committed patch carries the deletion" \
+    "$TAD/A/fake.projeny" "deleted file mode"
+expect_file_contains "the committed patch carries the rename" \
+    "$TAD/A/fake.projeny" "rename from"
+expect_file_contains "the committed patch carries the mode change" \
+    "$TAD/A/fake.projeny" "old mode"
+run_in "$TAD/A" expect_ok "re-setup after the commit" "$PROJENY" setup \
+    fake.projeny
+if [ -f "$TAD/A/fake/new.txt" ] && [ ! -f "$TAD/A/fake/src/b.c" ] && \
+   [ -f "$TAD/A/fake/docs.txt" ] && [ ! -f "$TAD/A/fake/README" ] && \
+   [ -x "$TAD/A/fake/src/a.c" ]; then
+    ok "the re-setup checkout keeps every applied effect"
+else
+    fail "the re-setup checkout keeps every applied effect" \
+        "ls: $(ls "$TAD/A/fake" 2>&1)"
+fi
+
+# ------------------- 311. apply: git-style diffs (plain + staged)
+if command -v git >/dev/null 2>&1; then
+    export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t \
+        GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+    TAG="$ROOT/t311"
+    mkdir -p "$TAG/repo/src" "$TAG/A"
+    # A real git repo seeded with the checkout's layout, so the diffs name
+    # the same paths the projeny checkout holds (a plain git diff carries
+    # no workdir label; the wid is picked by existence scoring).
+    (cd "$TAG/repo" && git init -q -b master . \
+        && printf 'int alpha = 1;\n\nint beta = 1;\n\nint gamma = 1;\n\nint delta = 1;\n' > src/a.c \
+        && printf 'line one v1\n' > src/b.c \
+        && printf 'hello v1\n' > README \
+        && git add -A && git commit -qm base)
+    # (a) a plain modify diff
+    (cd "$TAG/repo" \
+        && printf 'int alpha = 1;\n\nint beta = 1;\n\nint gamma = 42;\n\nint delta = 1;\n' > src/a.c \
+        && git diff > "$TAG/plain.diff" && git checkout -q -- src/a.c)
+    # (b) a staged add + exec-bit change + rename + deletion, so the diff
+    # carries new file mode / old+new mode / rename from-to / deleted file.
+    (cd "$TAG/repo" && printf 'staged by git\n' > newgit.txt \
+        && git add newgit.txt \
+        && chmod +x src/a.c && git update-index --chmod=+x src/a.c \
+        && git mv README docs.txt \
+        && git rm -q src/b.c \
+        && git diff --cached > "$TAG/staged.diff")
+    expect_file_contains "the staged git diff carries the exec mode" \
+        "$TAG/staged.diff" "new mode 100755"
+    expect_file_contains "the staged git diff carries the rename" \
+        "$TAG/staged.diff" "rename from"
+    cp "$TAP/fake-1.0.tar.gz" "$TAG/A/"
+    write_projeny "$TAG/A" fake 1.0 fake
+    run_in "$TAG/A" expect_ok "git fixture setup" "$PROJENY" setup fake.projeny
+    run_in "$TAG/A" expect_ok "apply a plain git diff" "$PROJENY" apply \
+        fake.projeny "$TAG/plain.diff"
+    if grep -q 'int gamma = 42;' "$TAG/A/fake/src/a.c"; then
+        ok "the plain git hunk lands"
+    else
+        fail "the plain git hunk lands" "$(cat "$TAG/A/fake/src/a.c")"
+    fi
+    run_in "$TAG/A" expect_ok "apply a staged git diff" "$PROJENY" apply \
+        fake.projeny "$TAG/staged.diff"
+    if [ -f "$TAG/A/fake/newgit.txt" ] && [ ! -f "$TAG/A/fake/src/b.c" ] && \
+       [ -f "$TAG/A/fake/docs.txt" ] && [ ! -f "$TAG/A/fake/README" ]; then
+        ok "the staged git add/rename/deletion land"
+    else
+        fail "the staged git add/rename/deletion land" \
+            "ls: $(ls "$TAG/A/fake" 2>&1)"
+    fi
+    if [ -x "$TAG/A/fake/src/a.c" ]; then
+        ok "the staged git exec bit lands"
+    else
+        fail "the staged git exec bit lands" "src/a.c is not executable"
+    fi
+    expect_file_contains "the staged git add is marked" \
+        "$TAG/A/.fake.projeny.status" "Added: newgit.txt"
+    expect_file_contains "the staged git deletion is marked" \
+        "$TAG/A/.fake.projeny.status" "Removed: src/b.c"
+    expect_file_contains "the staged git rename is marked" \
+        "$TAG/A/.fake.projeny.status" "Renamed: README -> docs.txt"
+    unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+else
+    ok "git-diff apply tests (skipped: no git)"
+fi
+
+# ------------------- 312. apply: on top of uncommitted changes
+TAU="$ROOT/t312"
+mkdir -p "$TAU/A" "$TAU/B"
+cp "$TAP/fake-1.0.tar.gz" "$TAU/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAU/B/"
+write_projeny "$TAU/A" fake 1.0 fake
+write_projeny "$TAU/B" fake 1.0 fake
+run_in "$TAU/A" expect_ok "uncommitted fixture setup A" "$PROJENY" setup \
+    fake.projeny
+run_in "$TAU/B" expect_ok "uncommitted fixture setup B" "$PROJENY" setup \
+    fake.projeny
+# B edits the bottom region; A edits the top region (uncommitted). The
+# fixture's a.c keeps the regions apart, so the hunks merge cleanly.
+printf 'int alpha = 1;\n\nint beta = 1;\n\nint gamma = 1;\n\nint delta = 500;\n' \
+    > "$TAU/B/fake/src/a.c"
+(cd "$TAU/B" && "$PROJENY" diff fake.projeny) > "$TAU/u.diff"
+printf 'int alpha = 777;\n\nint beta = 1;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TAU/A/fake/src/a.c"
+run_in "$TAU/A" expect_ok "apply onto uncommitted changes" "$PROJENY" apply \
+    fake.projeny "$TAU/u.diff"
+if grep -q 'int alpha = 777;' "$TAU/A/fake/src/a.c" && \
+   grep -q 'int delta = 500;' "$TAU/A/fake/src/a.c"; then
+    ok "the local and the patched edits coexist"
+else
+    fail "the local and the patched edits coexist" \
+        "$(cat "$TAU/A/fake/src/a.c")"
+fi
+
+# ------------------- 313. apply: conflict flow (exit 1, markers, resolve)
+TAC="$ROOT/t313"
+mkdir -p "$TAC/A" "$TAC/B"
+cp "$TAP/fake-1.0.tar.gz" "$TAC/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAC/B/"
+write_projeny "$TAC/A" fake 1.0 fake
+write_projeny "$TAC/B" fake 1.0 fake
+run_in "$TAC/A" expect_ok "conflict fixture setup A" "$PROJENY" setup \
+    fake.projeny
+run_in "$TAC/B" expect_ok "conflict fixture setup B" "$PROJENY" setup \
+    fake.projeny
+printf 'int alpha = 1;\n\nint beta = 99;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TAC/B/fake/src/a.c"
+(cd "$TAC/B" && "$PROJENY" diff fake.projeny) > "$TAC/c.diff"
+printf 'int alpha = 1;\n\nint beta = 77;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TAC/A/fake/src/a.c"
+crc=0
+cout="$(cd "$TAC/A" && "$PROJENY" apply fake.projeny "$TAC/c.diff" 2>&1)" || crc=$?
+if [ $crc -eq 1 ]; then
+    ok "a conflicting apply exits 1"
+else
+    fail "a conflicting apply exits 1" "exit=$crc out: $cout"
+fi
+case "$cout" in
+*"applied '$TAC/c.diff' to '$TAC/A/fake' with 1 conflict(s):"*)
+    ok "a conflicting apply reports the exact count"
+    ;;
+*)
+    fail "a conflicting apply reports the exact count" "out: $cout"
+    ;;
+esac
+case "$cout" in
+*"  src/a.c"*)
+    ok "a conflicting apply names the file as a bullet"
+    ;;
+*)
+    fail "a conflicting apply names the file as a bullet" "out: $cout"
+    ;;
+esac
+expect_file_contains "the conflicted file holds the opener" \
+    "$TAC/A/fake/src/a.c" "<<<<<<< current"
+expect_file_contains "the conflicted file holds the divider" \
+    "$TAC/A/fake/src/a.c" "======="
+expect_file_contains "the conflicted file holds the closer" \
+    "$TAC/A/fake/src/a.c" ">>>>>>> patched"
+expect_file_contains "the conflicted file keeps the current side" \
+    "$TAC/A/fake/src/a.c" "int beta = 77;"
+expect_file_contains "the conflicted file shows the patched side" \
+    "$TAC/A/fake/src/a.c" "int beta = 99;"
+expect_file_contains "apply records the conflict" \
+    "$TAC/A/.fake.projeny.status" "Conflict: src/a.c"
+# Hand-resolve (keep the patched side), then the normal resolve+commit flow.
+printf 'int alpha = 1;\n\nint beta = 99;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TAC/A/fake/src/a.c"
+run_in "$TAC/A" expect_ok "resolve clears the apply conflict" "$PROJENY" \
+    resolve fake.projeny fake/src/a.c
+run_in "$TAC/A" expect_ok "commit after resolving the apply conflict" \
+    "$PROJENY" commit fake.projeny
+
+# ------------------- 314. apply: refuse when a touched file is conflicted
+TARF="$ROOT/t314"
+mkdir -p "$TARF/A" "$TARF/B"
+cp "$TAP/fake-1.0.tar.gz" "$TARF/A/" && cp "$TAP/fake-1.0.tar.gz" "$TARF/B/"
+write_projeny "$TARF/A" fake 1.0 fake
+write_projeny "$TARF/B" fake 1.0 fake
+run_in "$TARF/A" expect_ok "refuse fixture setup A" "$PROJENY" setup \
+    fake.projeny
+run_in "$TARF/B" expect_ok "refuse fixture setup B" "$PROJENY" setup \
+    fake.projeny
+# First create a conflict on src/a.c in A (same dance as 313).
+printf 'int alpha = 1;\n\nint beta = 99;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TARF/B/fake/src/a.c"
+(cd "$TARF/B" && "$PROJENY" diff fake.projeny) > "$TARF/c.diff"
+printf 'int alpha = 1;\n\nint beta = 77;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TARF/A/fake/src/a.c"
+(cd "$TARF/A" && "$PROJENY" apply fake.projeny "$TARF/c.diff" \
+    >/dev/null 2>&1) || true
+expect_file_contains "the refuse fixture holds a conflict" \
+    "$TARF/A/.fake.projeny.status" "Conflict: src/a.c"
+# A patch that touches src/a.c AND adds another file.
+printf 'int alpha = 1;\n\nint beta = 88;\n\nint gamma = 1;\n\nint delta = 1;\n' \
+    > "$TARF/B/fake/src/a.c"
+printf 'should not appear\n' > "$TARF/B/fake/other.txt"
+run_in "$TARF/B" expect_ok "refuse fixture add" "$PROJENY" add fake.projeny \
+    fake/other.txt
+(cd "$TARF/B" && "$PROJENY" diff fake.projeny) > "$TARF/both.diff"
+cp "$TARF/A/.fake.projeny.status" "$TARF/status.snap"
+cp "$TARF/A/fake/src/a.c" "$TARF/a.c.snap"
+frc=0
+fout="$(cd "$TARF/A" && "$PROJENY" apply fake.projeny "$TARF/both.diff" 2>&1)" || frc=$?
+if [ $frc -ne 0 ]; then
+    ok "apply refuses when a touched file is conflicted"
+else
+    fail "apply refuses when a touched file is conflicted" "out: $fout"
+fi
+case "$fout" in
+*"already marked conflicted"*)
+    ok "the refusal names the conflicted touch"
+    ;;
+*)
+    fail "the refusal names the conflicted touch" "out: $fout"
+    ;;
+esac
+if [ ! -f "$TARF/A/fake/other.txt" ]; then
+    ok "the refusal creates nothing"
+else
+    fail "the refusal creates nothing" "other.txt was created"
+fi
+if cmp -s "$TARF/A/fake/src/a.c" "$TARF/a.c.snap"; then
+    ok "the refusal leaves the touched file untouched"
+else
+    fail "the refusal leaves the touched file untouched" "src/a.c changed"
+fi
+if cmp -s "$TARF/A/.fake.projeny.status" "$TARF/status.snap"; then
+    ok "the refusal leaves the status file byte-identical"
+else
+    fail "the refusal leaves the status file byte-identical" \
+        "status file changed"
+fi
+
+# ------------------- 315. apply: idempotence and chained renames
+TAI="$ROOT/t315"
+mkdir -p "$TAI/A" "$TAI/B"
+cp "$TAP/fake-1.0.tar.gz" "$TAI/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAI/B/"
+write_projeny "$TAI/A" fake 1.0 fake
+write_projeny "$TAI/B" fake 1.0 fake
+run_in "$TAI/A" expect_ok "idempotence fixture setup A" "$PROJENY" setup \
+    fake.projeny
+run_in "$TAI/B" expect_ok "idempotence fixture setup B" "$PROJENY" setup \
+    fake.projeny
+printf 'a brand new file\n' > "$TAI/B/fake/new.txt"
+run_in "$TAI/B" expect_ok "idempotence fixture add" "$PROJENY" add \
+    fake.projeny fake/new.txt
+run_in "$TAI/B" expect_ok "idempotence fixture rm" "$PROJENY" rm \
+    fake.projeny fake/src/b.c
+run_in "$TAI/B" expect_ok "idempotence fixture mv" "$PROJENY" mv \
+    fake.projeny fake/README fake/docs.txt
+(cd "$TAI/B" && "$PROJENY" diff fake.projeny) > "$TAI/adm.diff"
+run_in "$TAI/A" expect_ok "the first apply" "$PROJENY" apply fake.projeny \
+    "$TAI/adm.diff"
+run_in "$TAI/A" expect_ok "re-applying the same patch succeeds" "$PROJENY" \
+    apply fake.projeny "$TAI/adm.diff"
+nadd="$(grep -c '^Added: ' "$TAI/A/.fake.projeny.status")"
+nrem="$(grep -c '^Removed: ' "$TAI/A/.fake.projeny.status")"
+nren="$(grep -c '^Renamed: ' "$TAI/A/.fake.projeny.status")"
+if [ "$nadd" -eq 1 ] && [ "$nrem" -eq 1 ] && [ "$nren" -eq 1 ]; then
+    ok "re-applying does not duplicate the marks"
+else
+    fail "re-applying does not duplicate the marks" \
+        "added=$nadd removed=$nrem renamed=$nren"
+fi
+# A patch rename landing on a pending rename's destination chains onto the
+# original source, exactly like `mv` (and stays collapsed on re-apply).
+mkdir -p "$TAI/C"
+cp "$TAP/fake-1.0.tar.gz" "$TAI/C/"
+write_projeny "$TAI/C" fake 1.0 fake
+run_in "$TAI/C" expect_ok "chain fixture setup" "$PROJENY" setup fake.projeny
+run_in "$TAI/C" expect_ok "chain fixture mv" "$PROJENY" mv fake.projeny \
+    fake/README fake/README2
+cat > "$TAI/chain.diff" <<'EOF'
+diff --git a/fake/README2 b/fake/docs.txt
+similarity index 100%
+rename from README2
+rename to docs.txt
+EOF
+run_in "$TAI/C" expect_ok "apply a rename onto a pending rename" "$PROJENY" \
+    apply fake.projeny "$TAI/chain.diff"
+expect_file_contains "the chained rename records the original" \
+    "$TAI/C/.fake.projeny.status" "Renamed: README -> docs.txt"
+if grep -q '^Renamed: README -> README2' "$TAI/C/.fake.projeny.status"; then
+    fail "the chained rename collapses the pending pair" \
+        "the stale pair is still recorded"
+else
+    ok "the chained rename collapses the pending pair"
+fi
+run_in "$TAI/C" expect_ok "re-applying the chained rename succeeds" \
+    "$PROJENY" apply fake.projeny "$TAI/chain.diff"
+if [ "$(grep -c '^Renamed: ' "$TAI/C/.fake.projeny.status")" -eq 1 ]; then
+    ok "re-applying the chained rename does not duplicate"
+else
+    fail "re-applying the chained rename does not duplicate" \
+        "$(grep '^Renamed: ' "$TAI/C/.fake.projeny.status")"
+fi
+
+# ------------------- 316. apply: error paths and help
+TAE="$ROOT/t316"
+mkdir -p "$TAE"
+cp "$TAP/fake-1.0.tar.gz" "$TAE/"
+write_projeny "$TAE" fake 1.0 fake
+aout="$(cd "$TAE" && "$PROJENY" apply fake.projeny "$TAP/bottom.diff" 2>&1 || true)"
+case "$aout" in
+*"run setup first"*)
+    ok "apply without a status file dies naming setup"
+    ;;
+*)
+    fail "apply without a status file dies naming setup" "out: $aout"
+    ;;
+esac
+run_in "$TAE" expect_ok "error fixture setup" "$PROJENY" setup fake.projeny
+printf '' > "$TAE/empty.diff"
+eout="$(cd "$TAE" && "$PROJENY" apply fake.projeny empty.diff 2>&1)"; erc=$?
+if [ $erc -eq 0 ]; then
+    ok "an empty patch file is a clean no-op"
+else
+    fail "an empty patch file is a clean no-op" "exit=$erc out: $eout"
+fi
+case "$eout" in
+*"applied 'empty.diff'"*)
+    ok "the empty-patch no-op reports success"
+    ;;
+*)
+    fail "the empty-patch no-op reports success" "out: $eout"
+    ;;
+esac
+printf 'just some text\nno diffs here\n' > "$TAE/garbage.diff"
+gout="$(cd "$TAE" && "$PROJENY" apply fake.projeny garbage.diff 2>&1 || true)"
+case "$gout" in
+*"contains no diff blocks"*)
+    ok "a patch with no diff blocks is a hard error"
+    ;;
+*)
+    fail "a patch with no diff blocks is a hard error" "out: $gout"
+    ;;
+esac
+mout="$(cd "$TAE" && "$PROJENY" apply fake.projeny "$TAE/missing.diff" 2>&1 || true)"
+case "$mout" in
+*"cannot read file"*)
+    ok "a missing patch file is a hard error"
+    ;;
+*)
+    fail "a missing patch file is a hard error" "out: $mout"
+    ;;
+esac
+run_in "$TAE" expect_fail "apply with a missing argument fails" "$PROJENY" \
+    apply fake.projeny
+hout="$("$PROJENY" help apply 2>&1)"
+case "$hout" in
+*"inside a projeny checkout"*)
+    ok "help apply prints the apply topic"
+    ;;
+*)
+    fail "help apply prints the apply topic" "out: $hout"
+    ;;
+esac
+case "$hout" in
+*"exits 1"*)
+    ok "help apply documents the conflict exit code"
+    ;;
+*)
+    fail "help apply documents the conflict exit code" "out: $hout"
+    ;;
+esac
+uout="$("$PROJENY" 2>&1 || true)"
+case "$uout" in
+*"apply <f.projeny|dir> <patch-file>"*)
+    ok "usage lists apply"
+    ;;
+*)
+    fail "usage lists apply" "out: $uout"
+    ;;
+esac
+h2out="$("$PROJENY" help 2>&1)"
+case "$h2out" in
+*"apply a patch inside a checkout"*)
+    ok "help lists apply"
+    ;;
+*)
+    fail "help lists apply" "out: $h2out"
+    ;;
+esac
+
+# ------------------- 317. apply: binary adds roundtrip byte-exact
+TAB="$ROOT/t317"
+mkdir -p "$TAB/A" "$TAB/B"
+cp "$TAP/fake-1.0.tar.gz" "$TAB/A/" && cp "$TAP/fake-1.0.tar.gz" "$TAB/B/"
+write_projeny "$TAB/A" fake 1.0 fake
+write_projeny "$TAB/B" fake 1.0 fake
+run_in "$TAB/A" expect_ok "binary fixture setup A" "$PROJENY" setup \
+    fake.projeny
+run_in "$TAB/B" expect_ok "binary fixture setup B" "$PROJENY" setup \
+    fake.projeny
+printf 'bin\0ary\0with\0nuls' > "$TAB/B/fake/data.bin"
+printf '\000\001\002\377\376' > "$TAB/B/fake/small.bin"
+run_in "$TAB/B" expect_ok "binary fixture add" "$PROJENY" add fake.projeny \
+    fake/data.bin
+run_in "$TAB/B" expect_ok "binary fixture add two" "$PROJENY" add \
+    fake.projeny fake/small.bin
+(cd "$TAB/B" && "$PROJENY" diff fake.projeny) > "$TAB/bin.diff"
+expect_file_contains "the binary add travels base64" "$TAB/bin.diff" \
+    "GIT binary patch"
+run_in "$TAB/A" expect_ok "apply the binary add" "$PROJENY" apply \
+    fake.projeny "$TAB/bin.diff"
+if cmp -s "$TAB/B/fake/data.bin" "$TAB/A/fake/data.bin"; then
+    ok "the binary file lands byte-exact"
+else
+    fail "the binary file lands byte-exact" "data.bin differs"
+fi
+if cmp -s "$TAB/B/fake/small.bin" "$TAB/A/fake/small.bin"; then
+    ok "the second binary file lands byte-exact"
+else
+    fail "the second binary file lands byte-exact" "small.bin differs"
+fi
+expect_file_contains "the binary add is marked" \
+    "$TAB/A/.fake.projeny.status" "Added: data.bin"
+
 # ------------------------------------------------------------- summary
 echo "---"
 echo "passed: $PASS, failed: $FAIL"

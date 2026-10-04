@@ -4089,6 +4089,52 @@ std::string patch_wid_hint(const std::string& patch)
         return "";
     return shared;
 }
+
+// Pick the wid to apply `patch` with inside `dir`: candidates are (in
+// order) `prefer_base` ? {base_wid, patch_wid_hint(patch), ""} :
+// {patch_wid_hint(patch), base_wid, ""} (deduped, an empty hint skipped),
+// scored by how many patch_touched_paths exist under `dir`; strictly
+// greater count wins, ties keep the earlier candidate. An empty patch
+// keeps the first candidate.
+std::string pick_patch_wid(const std::string& dir, const std::string& patch,
+                           const std::string& base_wid, bool prefer_base)
+{
+    std::vector<std::string> candidates;
+    auto push = [&candidates](const std::string& c) {
+        if (std::find(candidates.begin(), candidates.end(), c) ==
+            candidates.end())
+            candidates.push_back(c);
+    };
+    std::string hint = patch_wid_hint(patch);
+    if (prefer_base) {
+        push(base_wid);
+        if (!hint.empty())
+            push(hint);
+    } else {
+        if (!hint.empty())
+            push(hint);
+        push(base_wid);
+    }
+    push("");
+    std::string use_wid = candidates[0];
+    if (!normalize_patch_text(patch).empty()) {
+        size_t best = 0;
+        bool have = false;
+        for (auto& cand : candidates) {
+            size_t hits = 0;
+            for (auto& rel : patch_touched_paths(patch, cand)) {
+                if (path_exists(join_path(dir, rel)))
+                    ++hits;
+            }
+            if (!have || hits > best) {
+                best = hits;
+                use_wid = cand;
+                have = true;
+            }
+        }
+    }
+    return use_wid;
+}
 } // namespace
 
 int cmd_patch(const std::string& dir, const std::string& patch_file)
@@ -4122,35 +4168,7 @@ int cmd_patch(const std::string& dir, const std::string& patch_file)
     // paths (trial application would "succeed" there by creating junk, so
     // existence scoring is used instead). Ties prefer the patch-derived
     // wid (authoritative when consistent), then the basename, then none.
-    std::vector<std::string> candidates;
-    {
-        std::string hint = patch_wid_hint(patch);
-        if (!hint.empty())
-            candidates.push_back(hint);
-        if (std::find(candidates.begin(), candidates.end(), wid) ==
-            candidates.end())
-            candidates.push_back(wid);
-        if (std::find(candidates.begin(), candidates.end(), "") ==
-            candidates.end())
-            candidates.push_back("");
-    }
-    std::string use_wid = candidates[0];
-    if (!normalize_patch_text(patch).empty()) {
-        size_t best = 0;
-        bool have = false;
-        for (auto& cand : candidates) {
-            size_t hits = 0;
-            for (auto& rel : patch_touched_paths(patch, cand)) {
-                if (path_exists(join_path(dir, rel)))
-                    ++hits;
-            }
-            if (!have || hits > best) {
-                best = hits;
-                use_wid = cand;
-                have = true;
-            }
-        }
-    }
+    std::string use_wid = pick_patch_wid(dir, patch, wid, false);
     std::vector<std::string> conflicts;
     bool clean = apply_patch_with_conflicts(dir, patch, use_wid,
                                             system_scratch_parent(),
@@ -4165,6 +4183,264 @@ int cmd_patch(const std::string& dir, const std::string& patch_file)
     for (auto& c : conflicts)
         printf("  %s\n", c.c_str());
     return 0;
+}
+
+int cmd_apply(const std::string& projeny_arg, const std::string& patch_file)
+{
+    // Absolutize before any workdir mutation (like cmd_rm/cmd_mv): applying
+    // a patch can create and delete directories, possibly including one the
+    // process's CWD sits under, and every later path — the status file
+    // write included — must not need the CWD again.
+    std::string pj = absolutize(resolve_projeny_path(projeny_arg, "apply"));
+    Ctx ctx = resolve_ctx(pj);
+    if (!path_exists(ctx.statusfile))
+        die("status file '" + ctx.statusfile + "' is missing; run setup first");
+    ProjenyFile cur = ProjenyFile::parse(ctx.projeny_arg);
+    StatusData st = StatusData::parse(ctx.statusfile);
+    std::string workdir = join_path(ctx.pdir, cur.name);
+    if (!is_dir(workdir)) {
+        // The checkout directory is gone: the status and snapshot files are
+        // stale state. Disregard them (warn + rename), then hard-error —
+        // there is no workdir to apply anything to.
+        disregard_stale_state(ctx, {cur.archive});
+        die("workdir '" + workdir + "' is missing; run setup first");
+    }
+    std::string patch = read_file_bytes(patch_file);
+    if (!normalize_patch_text(patch).empty()) {
+        // Refuse garbage input early: a non-empty patch file must hold at
+        // least one diff block, otherwise a typo'd path would "succeed".
+        bool any = false;
+        for (const std::string& line : split_lines(patch)) {
+            std::string t = ltrim(line);
+            if (starts_with(t, "diff --git ") || starts_with(t, "diff --cc ") ||
+                starts_with(t, "diff --combined ")) {
+                any = true;
+                break;
+            }
+        }
+        if (!any)
+            die("patch file '" + patch_file + "' contains no diff blocks");
+    } else {
+        // An empty (or whitespace-only) patch file changes nothing: report
+        // success without touching the status file.
+        printf("projeny: applied '%s' to '%s'\n", patch_file.c_str(),
+               workdir.c_str());
+        return 0;
+    }
+    // The patch may label files with any wid (its source checkout's name)
+    // or with none (a plain git diff); prefer the checkout's own name on
+    // ties, since the patch is being applied inside this checkout.
+    std::string use_wid = pick_patch_wid(workdir, patch, cur.name, true);
+
+    // Pre-flight, before anything is mutated: refuse when the patch would
+    // touch a file that is already marked conflicted. Those need hand
+    // resolution first (re-applying over half-resolved markers would bake
+    // them into the result), so the whole command does nothing at all —
+    // no filesystem changes and no status write — when any touched path is
+    // conflicted.
+    {
+        std::vector<std::string> hit;
+        for (auto& rel : patch_touched_paths(patch, use_wid)) {
+            if (std::find(st.conflicts.begin(), st.conflicts.end(), rel) !=
+                st.conflicts.end())
+                hit.push_back(rel);
+        }
+        if (!hit.empty()) {
+            sort_unique(&hit);
+            die("cannot apply '" + patch_file +
+                    "': the patch touches files that are already marked "
+                    "conflicted",
+                bullet_list(hit));
+        }
+    }
+
+    // Classify the patch so the status file can record what it does. The
+    // rename pairs mirror what the applier moves; the pure adds are the
+    // add-paths list minus rename destinations; the deletes exclude
+    // renames.
+    std::vector<std::pair<std::string, std::string>> rens =
+        vcs_rename_pairs(patch, use_wid);
+    std::vector<std::string> adds;
+    for (auto& a : vcs_add_paths(patch, use_wid)) {
+        bool rename_dst = false;
+        for (auto& r : rens) {
+            if (r.second == a) {
+                rename_dst = true;
+                break;
+            }
+        }
+        if (!rename_dst)
+            adds.push_back(a);
+    }
+    std::vector<std::string> dels = vcs_deleted_paths(patch, use_wid);
+
+    std::vector<std::string> conflicts;
+    bool clean = apply_patch_with_conflicts(workdir, patch, use_wid,
+                                            system_scratch_parent(),
+                                            &conflicts);
+    sort_unique(&conflicts);
+
+    // Post-apply bookkeeping, mirroring what add/rm/mv record by hand:
+    // pending added/removed/renamed entries make the next `commit` fold
+    // the patch into the .projeny file. Every step checks the post-apply
+    // workdir, so failed (conflicted) blocks keep their old marks.
+    std::vector<std::string> newly_added, newly_removed;
+    std::vector<std::pair<std::string, std::string>> newly_renamed;
+    auto in_added = [&st](const std::string& p) {
+        return std::find(st.added.begin(), st.added.end(), p) != st.added.end();
+    };
+    auto in_removed = [&st](const std::string& p) {
+        return std::find(st.removed.begin(), st.removed.end(), p) !=
+               st.removed.end();
+    };
+    // Pure adds: the file exists again, so record it as added (un-removing
+    // it first, like `projeny add` does).
+    for (auto& a : adds) {
+        if (!path_exists(join_path(workdir, a)))
+            continue; // paranoia: the add failed as a conflict
+        st.removed.erase(std::remove(st.removed.begin(), st.removed.end(), a),
+                         st.removed.end());
+        if (!in_added(a)) {
+            st.added.push_back(a);
+            newly_added.push_back(a);
+        }
+    }
+    // Pure deletes: a failed delete keeps the file on disk (it is already
+    // recorded as a conflict above), so only really-gone paths are marked.
+    for (auto& d : dels) {
+        if (path_exists(join_path(workdir, d)))
+            continue; // conflicted delete: the file survived
+        bool was_added = in_added(d);
+        st.added.erase(std::remove(st.added.begin(), st.added.end(), d),
+                       st.added.end());
+        // Rename hygiene: a pending rename whose destination is now gone
+        // collapses — the renamed-away source is truly gone, so it takes
+        // the removal mark; a pending rename whose source is d is dropped
+        // too (its destination's disappearance is the delete).
+        std::vector<std::pair<std::string, std::string>> kept;
+        for (auto& rn : st.renamed) {
+            if (rn.second == d) {
+                if (!in_added(rn.first) && !in_removed(rn.first)) {
+                    st.removed.push_back(rn.first);
+                    newly_removed.push_back(rn.first);
+                }
+            } else if (rn.first != d) {
+                kept.push_back(rn);
+            }
+        }
+        st.renamed = kept;
+        if (!was_added && !in_removed(d)) {
+            st.removed.push_back(d);
+            newly_removed.push_back(d);
+        }
+    }
+    // Renames: record only ones that actually happened (the source is gone
+    // and the destination exists); a failed rename is a conflict, already
+    // recorded. Chaining mirrors `projeny mv` onto a pending rename.
+    for (auto& r : rens) {
+        const std::string& s = r.first;
+        const std::string& t = r.second;
+        if (path_exists(join_path(workdir, s)) ||
+            !path_exists(join_path(workdir, t)))
+            continue;
+        // A patch may rename through a path it creates and consumes
+        // within the same run (blocks "a -> b" then "b -> c"): by
+        // bookkeeping time both moves have happened, so the intermediate
+        // pair fails the liveness check above and only the last block's
+        // destination is alive. Follow the patch's own pairs backwards
+        // from the live destination to the true origin. An earlier pair
+        // re-keys the source only when its own source is gone too — the
+        // fingerprint of a move that actually happened; a blocked or
+        // already rename keeps its source in place and must not be
+        // re-keyed (the liveness test would then pin a rename onto a
+        // file that is still there).
+        std::string src = s;
+        {
+            std::vector<std::string> seen{src};
+            bool moved = true;
+            while (moved) {
+                moved = false;
+                for (auto& q : rens) {
+                    if (q.second != src || q.first == src)
+                        continue;
+                    if (std::find(seen.begin(), seen.end(), q.first) !=
+                        seen.end())
+                        continue;
+                    if (path_exists(join_path(workdir, q.first)))
+                        continue;
+                    src = q.first;
+                    seen.push_back(src);
+                    moved = true;
+                    break;
+                }
+            }
+        }
+        bool was_added = in_added(src);
+        if (was_added) {
+            st.added.erase(std::remove(st.added.begin(), st.added.end(), src),
+                           st.added.end());
+            if (!in_added(t)) {
+                st.added.push_back(t);
+                newly_added.push_back(t);
+            }
+        } else {
+            // If src was itself a rename destination, chain to the original.
+            std::string orig = src;
+            std::vector<std::pair<std::string, std::string>> kept;
+            for (auto& rn : st.renamed) {
+                if (rn.second == src)
+                    orig = rn.first;
+                else
+                    kept.push_back(rn);
+            }
+            st.renamed = kept;
+            // Re-applying an already-recorded rename must not duplicate
+            // the pair (idempotence): when the destination is already the
+            // destination of a pending rename, this patch's rename either
+            // is that exact pair or was folded into it by a previous
+            // apply (the chain above re-keyed it), so there is nothing
+            // left to record.
+            bool recorded = false;
+            for (auto& rn : st.renamed) {
+                if (rn.second == t) {
+                    recorded = true;
+                    break;
+                }
+            }
+            if (orig != t && !recorded) {
+                st.renamed.push_back({orig, t});
+                newly_renamed.push_back({orig, t});
+            }
+        }
+        // Moving onto a pending-removed path un-removes it.
+        st.removed.erase(std::remove(st.removed.begin(), st.removed.end(), t),
+                         st.removed.end());
+    }
+    // Conflicts: union in and keep the canonical sorted form.
+    for (auto& c : conflicts) {
+        if (std::find(st.conflicts.begin(), st.conflicts.end(), c) ==
+            st.conflicts.end())
+            st.conflicts.push_back(c);
+    }
+    sort_unique(&st.conflicts);
+    write_status(ctx, st);
+    for (auto& a : newly_added)
+        printf("projeny: marked '%s' as added\n", a.c_str());
+    for (auto& r : newly_removed)
+        printf("projeny: marked '%s' as removed\n", r.c_str());
+    for (auto& r : newly_renamed)
+        printf("projeny: marked '%s' -> '%s' as renamed\n", r.first.c_str(),
+               r.second.c_str());
+    if (clean) {
+        printf("projeny: applied '%s' to '%s'\n", patch_file.c_str(),
+               workdir.c_str());
+        return 0;
+    }
+    printf("projeny: applied '%s' to '%s' with %zu conflict(s):\n",
+           patch_file.c_str(), workdir.c_str(), conflicts.size());
+    for (auto& c : conflicts)
+        printf("  %s\n", c.c_str());
+    return 1;
 }
 
 // ---- package / extract ----
@@ -6233,6 +6509,8 @@ int cmd_help(const std::string& arg0)
            "  diff <f.projeny|dir>             print a checkout's uncommitted diff\n"
            "  diff <dir> <other-dir>           print the diff between two trees\n"
            "  patch <dir> <patch-file>         apply a patch file to a tree\n"
+           "  apply <f.projeny|dir> <patch-file>\n"
+           "                                   apply a patch inside a checkout\n"
            "  package <f.projeny|dir> <out> [...]\n"
            "                                   setup, then tar the tracked files\n"
            "  extract <f.projeny|dir> <dest> [...]\n"
@@ -6791,6 +7069,51 @@ int cmd_help_topic(const std::string& arg0, const std::string& topic)
                t);
         return 0;
     }
+    if (topic == "apply") {
+        printf("%s apply <f.projeny|dir> <patch-file>\n"
+               "\n"
+               "Apply a patch file inside a projeny checkout, on top of the\n"
+               "uncommitted changes it already has. The patch may be any\n"
+               "git diff or any projeny diff (including `projeny diff`\n"
+               "output): text hunks apply with fuzz, and adds, deletes,\n"
+               "renames, and mode changes (exec bit, symlinks) are applied\n"
+               "to the files. The patch's workdir label (if any) is\n"
+               "detected automatically.\n"
+               "\n"
+               "Unlike `patch`, this command also books the patch into the\n"
+               "status file, so a later `commit` folds it into the\n"
+               ".projeny patch: files the patch adds are marked added,\n"
+               "files it deletes are marked removed, renames are recorded\n"
+               "as pending renames (chained through existing pending\n"
+               "renames exactly like `mv`), and a patch add un-removes a\n"
+               "pending removal. Only blocks that really applied count: a\n"
+               "failed (conflicted) add, delete, or rename leaves the old\n"
+               "marks alone.\n"
+               "Blocks that already applied are skipped, so re-applying is\n"
+               "idempotent.\n"
+               "Conflicted blocks get inline markers (<<<<<<< current /\n"
+               "======= / >>>>>>> patched; matching hunks still apply,\n"
+               "deletions/renames/binary blocks are left for you), the\n"
+               "files are marked conflicted in the status file, and the\n"
+               "command exits 1 — resolve with `projeny resolve` (fixing\n"
+               "the markers by hand), then `commit`.\n"
+               "When the patch touches a file that is already marked\n"
+               "conflicted, nothing is applied at all — no filesystem\n"
+               "change and no status write — and the command hard-errors;\n"
+               "resolve those conflicts first. An empty patch file is a\n"
+               "silent no-op; a non-empty patch with no diff blocks, or a\n"
+               "missing patch file, is a hard error. git base85 binary\n"
+               "payloads (and payload-less \"Binary files ... differ\"\n"
+               "stanzas) cannot be applied and become conflicts, while\n"
+               "projeny's own base64 binary sections apply.\n"
+               "\n"
+               "Like every project-taking command, the <f.projeny|dir>\n"
+               "argument may also be the workdir or another directory\n"
+               "holding exactly one .projeny file, or a path whose\n"
+               "'<arg>.projeny' sibling exists.\n",
+               t);
+        return 0;
+    }
     if (topic == "package") {
         printf("%s package <f.projeny|dir> <output-tarball>\n"
                "\n"
@@ -7117,7 +7440,7 @@ int cmd_help_topic(const std::string& arg0, const std::string& topic)
                "\n"
                "With no arguments, list all commands. With a command name\n"
                "(setup, commit, add, rm, mv, resolve, rebase, create,\n"
-               "status, diff, patch, package, extract, download,\n"
+               "status, diff, patch, apply, package, extract, download,\n"
                "erase-setup, freeze-mtime, unfreeze-mtime,\n"
                "list-frozen-mtimes, get-attributes, hash, help), print a\n"
                "detailed explanation of that command.\n",

@@ -58,6 +58,7 @@ projeny status <f.projeny|dir>              show setup/conflict/pending state
 projeny diff <f.projeny|dir>                print a checkout's uncommitted diff
 projeny diff <dir> <other-dir>              print the diff between two trees
 projeny patch <dir> <patch-file>            apply a patch file to a tree
+projeny apply <f.projeny|dir> <patch-file>  apply a patch inside a checkout
 projeny package <f.projeny|dir> <out>       setup, then tar the tracked files; pairs run in parallel
 projeny extract <f.projeny|dir> <dest>      setup, then copy tracked files; pairs run in parallel
 projeny download <url> <hash> [...]         download URL/hash pairs into the cwd
@@ -262,6 +263,25 @@ Paths into the work tree may be CWD-relative, absolute, or workdir-relative
   fuzz; already-applied blocks are skipped. Unapplyable blocks become
   conflicts: markers (`<<<<<<< current` / `=======` / `>>>>>>> patched`)
   go inline and the conflicted files are listed on stdout (exit stays 0).
+- `apply <f.projeny|dir> <patch-file>`: applies a patch file inside a
+  projeny checkout, on top of the uncommitted changes it already has.
+  The patch may be any git diff or any projeny diff (including `projeny
+  diff` output; the workdir label, if any, is detected automatically).
+  Unlike `patch`, the command also books the patch into the status file
+  so a later `commit` folds it into the `.projeny` patch: files the patch
+  adds are marked added, files it deletes are marked removed, renames are
+  recorded as pending renames (chained through existing pending renames
+  exactly like `mv`), and mode changes (exec bit, symlinks) are applied
+  to the files. Already-applied blocks are skipped, so re-applying is
+  idempotent. Unapplyable blocks get the same inline conflict markers and
+  are marked conflicted in the status file, and the command exits 1 —
+  resolve with `projeny resolve`, then `commit`. When the patch touches a
+  file that is already marked conflicted nothing is applied at all (no
+  filesystem change, no status write) and the command hard-errors.
+  An empty patch file is a no-op; a non-empty patch with no diff blocks
+  is a hard error. git base85 binary payloads (and payload-less "Binary
+  files ... differ" stanzas) cannot be applied and become conflicts,
+  while projeny's own base64 binary sections apply.
 - `package <f.projeny|dir> <output-tarball>`: runs `setup` (so uncommitted
   workdir changes are included, and conflicts fail the command with a
   nonzero exit and no archive), then tars up exactly the tracked files —
@@ -421,12 +441,16 @@ decides:
 The exit status is 0 whenever the diff itself succeeds — even when it
 prints changes or warnings. stdout carries only the patch; warnings go to
 stderr. Combined with `projeny patch`, the diff moves a change between
-checkouts:
+checkouts (`projeny apply` is the checkout-aware variant: it also records
+the patch's adds/deletes/renames in the status file, so a later `commit`
+folds them in):
 
 ```
 projeny diff mylib.projeny > /tmp/uncommitted.patch
 # ...in a second checkout of the same .projeny file:
 projeny patch mylib /tmp/uncommitted.patch
+# ...or, booking the change for the next commit:
+projeny apply mylib /tmp/uncommitted.patch
 ```
 
 ## Recovering a git-conflicted `.projeny` file
@@ -988,7 +1012,12 @@ preservation, no-change commits, and CLI error paths — plus optional
 `git apply --check` / `patch -p1 --dry-run` compatibility spot-checks that
 verify stored patches with those tools when they are installed, plus
 `diff`/`patch` roundtrips and minimum-diff cases, `patch` conflict
-markers with console lists, setup-restores-accidentally-deleted-files
+markers with console lists, `apply` inside a checkout (projeny and git
+diffs on top of uncommitted changes, add/delete/rename/mode marks that
+`commit` folds in, the conflict exit-1 flow, the
+refuse-when-a-touched-file-is-conflicted guarantee, idempotent re-apply
+with chained renames, binary-add roundtrips),
+setup-restores-accidentally-deleted-files
 (text and binary; explicit `rm` stays deleted), tarball-mtime preservation
 through setup/extract/package (patched files go newer), untracked-binary
 tolerance (binaries ride along across setups and stay out of patches until

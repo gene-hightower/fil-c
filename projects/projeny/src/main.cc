@@ -39,6 +39,7 @@ int usage(const char* arg0, bool err)
     fprintf(f,
             "usage: %s "
             "<setup|commit|add|rm|mv|resolve|rebase|create|status|diff|patch|"
+            "apply|"
             "package|extract|"
             "download|erase-setup|freeze-mtime|unfreeze-mtime|list-frozen-mtimes|get-attributes|hash|"
             "help> "
@@ -58,6 +59,7 @@ int usage(const char* arg0, bool err)
             "  diff <f.projeny|dir>\n"
             "  diff <dir> <other-dir>\n"
             "  patch <dir> <patch-file>\n"
+            "  apply <f.projeny|dir> <patch-file>\n"
             "  package <f.projeny|dir> <output> [...]\n"
             "  extract <f.projeny|dir> <dest> [...]\n"
             "  download <url> <hash> [<url> <hash>...]\n"
@@ -360,6 +362,11 @@ int main(int argc, char** argv)
             if (args.size() != 3)
                 return usage(arg0.c_str(), true);
             return cmd_patch(args[1], args[2]);
+        }
+        if (cmd == "apply") {
+            if (args.size() != 3)
+                return usage(arg0.c_str(), true);
+            return cmd_apply(args[1], args[2]);
         }
         if (cmd == "freeze-mtime") {
             if (args.size() < 3)

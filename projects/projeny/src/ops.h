@@ -92,6 +92,18 @@ int cmd_status(const std::string& projeny_arg);
 int cmd_diff_projeny(const std::string& projeny_arg);
 int cmd_diff(const std::string& dir, const std::string& other_dir);
 int cmd_patch(const std::string& dir, const std::string& patch_file);
+
+// Apply a patch file (any git diff, any projeny diff — including `projeny
+// diff` output) inside a projeny checkout, on top of the uncommitted
+// changes it already has. Files the patch adds are marked added and files
+// it deletes removed in the status file; renames are recorded as pending
+// renames and mode changes (exec bit, symlinks) are applied to the files.
+// Already-applied blocks are skipped (re-applying is safe). Blocks that do
+// not apply get inline conflict markers (<<<<<<< current / ======= /
+// >>>>>>> patched) and their files are marked conflicted; the command then
+// exits 1. When the patch touches a file that is already marked conflicted
+// nothing is applied at all and the command hard-errors.
+int cmd_apply(const std::string& projeny_arg, const std::string& patch_file);
 int cmd_package(const std::string& projeny_arg, const std::string& output);
 int cmd_extract(const std::string& projeny_arg, const std::string& dest_dir);
 // Parallel multi-project package/extract: (project, output/dest) pairs run

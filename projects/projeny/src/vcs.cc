@@ -3443,6 +3443,42 @@ std::vector<std::string> vcs_deleted_paths(const std::string& patch,
     return patch_side_paths(patch, wid, false);
 }
 
+std::vector<std::pair<std::string, std::string>> vcs_rename_pairs(
+    const std::string& patch, const std::string& wid)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    if (patch.empty())
+        return out;
+    for (auto& b : parse_patch(patch, wid)) {
+        if (b.is_combined)
+            continue;
+        // Exactly the two shapes apply_block moves: headered renames
+        // (projeny's emitter and `git diff -M` both write `rename from`/
+        // `rename to`, and the parser wid-strips those like every other
+        // path), plus header-less blocks whose sides disagree
+        // (--- a/old +++ b/new), which the applier treats as a rename too.
+        std::string from, to;
+        if (b.is_rename) {
+            if (b.rename_from.empty() || b.rename_to.empty())
+                continue;
+            from = b.rename_from;
+            to = b.rename_to;
+        } else if (b.has_old && b.has_new && !b.old_rel.empty() &&
+                   !b.new_rel.empty() && b.new_rel != b.old_rel) {
+            from = b.old_rel;
+            to = b.new_rel;
+        } else {
+            continue;
+        }
+        if (from.empty() || to.empty() || from == to)
+            continue;
+        if (std::find(out.begin(), out.end(), std::make_pair(from, to)) ==
+            out.end())
+            out.push_back({from, to});
+    }
+    return out;
+}
+
 namespace {
 bool vcs_is_prefix_path(const std::string& pre, const std::string& full)
 {
