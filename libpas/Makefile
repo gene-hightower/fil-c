@@ -217,6 +217,34 @@ PASPIZLOTESTGCVERIFYOBJS = \
 
 FILPIZLOOBJS = $(patsubst %.c,$(BUILDDIR)/fil-pizlo-%.o,$(notdir $(FILSRCS)))
 
+# The objects and depfiles record the absolute paths of the trees they were
+# built against (pizfix/yolo-include, pizfix/stdfil-include, etc.), because
+# FILC_OUTPUT_ROOT resolves to an absolute path that the compiler sees via
+# -isystem and -include flags.  If the checkout is subsequently built from a
+# different location -- most commonly the same tree bind-mounted at /fil-c
+# inside the enter_container.sh container versus the host path, or vice
+# versa -- the paths recorded in $(BUILDDIR)/*.d dangle and make aborts with
+# "No rule to make target ... normalize.inc".  Guard against that with a
+# cookie, in the same spirit as configure_cmake_project.sh: if the cookie is
+# missing or does not match the current location and compiler, wipe the build
+# directory so that everything is rebuilt against the current paths.  The
+# location and compiler paths are normalized with $(abspath ...) so that
+# relative spellings (like the default `../build/bin/clang`) and absolute
+# spellings of the same location compare equal.  This must happen before the
+# depfiles are included below.  Note that the $(shell) housekeeping above
+# executes even under `make -n`, so a dry run can still delete $(BUILDDIR)
+# when the cookie mismatches.
+FILC_BUILD_COOKIE = $(BUILDDIR)/filc_cookie_1.txt
+FILC_BUILD_COOKIE_STAMP := $(shell hostname):$(CURDIR) ::: $(abspath $(FILC_OUTPUT_ROOT)) ::: $(abspath $(FILC_CLANG))
+
+ifneq ($(shell cat $(FILC_BUILD_COOKIE) 2>/dev/null),$(FILC_BUILD_COOKIE_STAMP))
+ifneq ($(wildcard $(BUILDDIR)/*),)
+$(info libpas: $(BUILDDIR) comes from a different checkout location or compiler; rebuilding it.)
+endif
+$(shell rm -rf $(BUILDDIR))
+$(shell mkdir -p $(BUILDDIR) && printf '%s\n' '$(FILC_BUILD_COOKIE_STAMP)' > $(FILC_BUILD_COOKIE))
+endif
+
 -include $(wildcard $(BUILDDIR)/*.d)
 
 clean:

@@ -182,41 +182,11 @@ case "$MODE" in
         ;;
 esac
 
-# If not forcing a new container, check if one is already running
-if [ "$FORCE_NEW" = false ]; then
-    CONTAINERS=$(podman ps --filter "label=${CONTAINER_LABEL}" --format "{{.ID}}")
-
-    if [ -n "$CONTAINERS" ]; then
-        # Count how many containers we found
-        CONTAINER_COUNT=$(echo "$CONTAINERS" | wc -l)
-
-        if [ "$CONTAINER_COUNT" -eq 1 ]; then
-            CONTAINER_ID="$CONTAINERS"
-            if [ "$DISPLAY" = false ]; then
-                echo "Attaching to existing Fil-C container ${CONTAINER_ID}..."
-            fi
-        else
-            if [ "$DISPLAY" = false ]; then
-                echo "Found ${CONTAINER_COUNT} running Fil-C containers for this checkout:"
-                echo "$CONTAINERS"
-                echo "Attaching to the first one..."
-            fi
-            CONTAINER_ID=$(echo "$CONTAINERS" | head -n 1)
-        fi
-
-        if [ "$DISPLAY" = true ]; then
-            echo "$CONTAINER_ID"
-            exit 0
-        fi
-        
-        exec podman exec -it "$CONTAINER_ID" /bin/bash
-    fi
-
-    if [ "$DISPLAY" = true ]; then
-        echo "No container running."
-        exit 1
-    fi
-fi
+# -d is a read-only query: it must print exactly one line (the container ID,
+# suitable for `podman exec -it`) and touch nothing on disk, so skip Dockerfile
+# generation entirely in that mode.  -d always exits inside the attach block
+# below, before anything needs the image tag.
+if [ "$DISPLAY" = false ]; then
 
 # Generate Dockerfile based on mode
 DOCKERFILE_PATH="${SCRIPT_DIR}/.dockerfile-${IMAGE_TAG}"
@@ -419,6 +389,70 @@ WORKDIR ${WORKDIR}
 # Start an interactive Bash shell by default when the container runs
 CMD ["/bin/bash"]
 DOCKERFILE_END
+
+# Mix a hash of the generated Dockerfile's contents into the image tag.  That
+# way, any change to the image definition (like adding a package) changes the
+# tag, so the image gets rebuilt, instead of silently reusing a stale image
+# that was built from an older version of the generated Dockerfile.
+CONTENT_HASH=$(sha256sum "${DOCKERFILE_PATH}" | cut -c1-8)
+IMAGE_TAG="${IMAGE_TAG}-${CONTENT_HASH}"
+mv "${DOCKERFILE_PATH}" "${SCRIPT_DIR}/.dockerfile-${IMAGE_TAG}"
+DOCKERFILE_PATH="${SCRIPT_DIR}/.dockerfile-${IMAGE_TAG}"
+
+fi
+
+# If not forcing a new container, check if one is already running
+if [ "$FORCE_NEW" = false ]; then
+    CONTAINERS=$(podman ps --filter "label=${CONTAINER_LABEL}" --format "{{.ID}} {{.Image}}")
+
+    if [ -n "$CONTAINERS" ]; then
+        # Count how many containers we found
+        CONTAINER_COUNT=$(echo "$CONTAINERS" | wc -l)
+
+        if [ "$CONTAINER_COUNT" -eq 1 ]; then
+            CONTAINER_ID=$(echo "$CONTAINERS" | cut -d ' ' -f 1)
+            CONTAINER_IMAGE=$(echo "$CONTAINERS" | cut -d ' ' -f 2)
+            if [ "$DISPLAY" = false ]; then
+                echo "Attaching to existing Fil-C container ${CONTAINER_ID}..."
+            fi
+        else
+            if [ "$DISPLAY" = false ]; then
+                echo "Found ${CONTAINER_COUNT} running Fil-C containers for this checkout:"
+                echo "$CONTAINERS"
+                echo "Attaching to the first one..."
+            fi
+            CONTAINER_ID=$(echo "$CONTAINERS" | head -n 1 | cut -d ' ' -f 1)
+            CONTAINER_IMAGE=$(echo "$CONTAINERS" | head -n 1 | cut -d ' ' -f 2)
+        fi
+
+        # Real podman reports locally built images with a localhost/ prefix;
+        # strip it so that the comparison below matches the short name that
+        # this script builds with.  A no-op when there is no prefix.
+        CONTAINER_IMAGE="${CONTAINER_IMAGE#localhost/}"
+
+        if [ "$DISPLAY" = true ]; then
+            echo "$CONTAINER_ID"
+            exit 0
+        fi
+
+        # Tell the user if the running container comes from a different image
+        # than the one this script would use now.  That means the container
+        # predates a change to the image definition (for example a newly
+        # added package) and may be missing it; -f recreates it.
+        if [ "$CONTAINER_IMAGE" != "${IMAGE_NAME}:${IMAGE_TAG}" ]; then
+            echo "WARNING: the running container was created from image ${CONTAINER_IMAGE}," >&2
+            echo "but this script would now create containers from ${IMAGE_NAME}:${IMAGE_TAG}." >&2
+            echo "The running container may be stale; exit and rerun with -f to recreate it." >&2
+        fi
+
+        exec podman exec -it "$CONTAINER_ID" /bin/bash
+    fi
+
+    if [ "$DISPLAY" = true ]; then
+        echo "No container running."
+        exit 1
+    fi
+fi
 
 # Build the image if it doesn't exist
 if ! podman image exists "${IMAGE_NAME}:${IMAGE_TAG}"; then

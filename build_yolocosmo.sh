@@ -271,5 +271,9 @@ do
     make -C libpas -f Makefile FILCARCH=$COSMOARCH \
         FILC_OUTPUT_ROOT=`pwd`/pizfix \
         FILC_CLANG=`pwd`/build/bin/clang \
-        all
+        clean
+    make -C libpas -f Makefile FILCARCH=$COSMOARCH \
+        FILC_OUTPUT_ROOT=`pwd`/pizfix \
+        FILC_CLANG=`pwd`/build/bin/clang \
+        all -j $NCPU
 done

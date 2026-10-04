@@ -205,5 +205,5 @@ PASASMSRCS = $(sort $(wildcard src/libpas/*.S))
 
 src/libpas/filc_native.h: src/libpas/generate_pizlonated_forwarders.rb
 	ruby src/libpas/generate_pizlonated_forwarders.rb src/libpas/filc_native.h
-src/libpas/filc_native_forwarders.c: src/libpas/generate_pizlonated_forwarders.rb
+src/libpas/filc_native_forwarders.c: src/libpas/generate_pizlonated_forwarders.rb src/libpas/filc_native.h
 	ruby src/libpas/generate_pizlonated_forwarders.rb src/libpas/filc_native_forwarders.c

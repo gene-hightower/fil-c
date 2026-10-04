@@ -127,19 +127,39 @@ case "$MODE" in
         exit 1
 esac
 
-DOCKERFILE_PATH="${SCRIPT_DIR}/.dockerfile-${IMAGE_TAG}"
+# enter_container.sh tags images "${IMAGE_NAME}:${IMAGE_TAG}" with a hash of
+# the generated Dockerfile's contents appended, so that changes to the image
+# definition produce a new tag instead of silently reusing a stale image.  We
+# cannot know that hash here without generating the Dockerfile, so instead
+# match every existing tag that is either exactly ${IMAGE_TAG} (the legacy
+# spelling from before the hash was introduced) or
+# ${IMAGE_TAG}-<8 lowercase hex digits> (any content-hash variant of this
+# checkout and mode).  The anchor after ${IMAGE_TAG} keeps other modes' images
+# (e.g. the -pizlix-... and -optfil-... tags, which share the checkout hash
+# prefix) untouched, and the localhost/ prefix that podman reports for locally
+# built images is stripped before matching.
+MATCHING_IMAGES=$(podman images --format "{{.Repository}}:{{.Tag}}" \
+    | sed 's|^localhost/||' \
+    | grep -E "^${IMAGE_NAME}:${IMAGE_TAG}(-[0-9a-f]{8})?$" \
+    || true)
 
-# Check if the image exists
-if podman image exists "${IMAGE_NAME}:${IMAGE_TAG}"; then
-    echo "Removing ${IMAGE_NAME}:${IMAGE_TAG} container image..."
-    podman rmi "${IMAGE_NAME}:${IMAGE_TAG}"
-    echo "Image removed successfully!"
+if [ -n "$MATCHING_IMAGES" ]; then
+    echo "Removing container image(s):"
+    echo "$MATCHING_IMAGES"
+    podman rmi $MATCHING_IMAGES
+    echo "Image(s) removed successfully!"
 
-    # Clean up generated Dockerfile if it exists
-    if [ -f "${DOCKERFILE_PATH}" ]; then
-        echo "Removing generated Dockerfile ${DOCKERFILE_PATH}..."
-        rm -f "${DOCKERFILE_PATH}"
-    fi
+    # Clean up the generated Dockerfiles that go with the removed images.
+    for TAGGED_IMAGE in $MATCHING_IMAGES
+    do
+        TAG="${TAGGED_IMAGE#${IMAGE_NAME}:}"
+        DOCKERFILE_PATH="${SCRIPT_DIR}/.dockerfile-${TAG}"
+        if [ -f "${DOCKERFILE_PATH}" ]
+        then
+            echo "Removing generated Dockerfile ${DOCKERFILE_PATH}..."
+            rm -f "${DOCKERFILE_PATH}"
+        fi
+    done
 else
-    echo "Image ${IMAGE_NAME}:${IMAGE_TAG} does not exist. Nothing to do."
+    echo "No ${IMAGE_NAME}:${IMAGE_TAG}* container image exists. Nothing to do."
 fi

@@ -57,6 +57,8 @@ IMAGE_NAME="fil-c-dev"
 IMAGE_TAG="${CHECKOUT_HASH}"
 ```
 
+In practice the image tag is `${CHECKOUT_HASH}` with an 8-hex-digit content hash of the generated Dockerfile appended (so that changes to the image definition produce a new tag instead of silently reusing a stale image), and `./reset_container.sh` removes the image for this checkout regardless of that hash.
+
 This means:
 - Different checkouts can experiment with different Dockerfiles independently
 - Modifying the Dockerfile in one checkout doesn't affect others
