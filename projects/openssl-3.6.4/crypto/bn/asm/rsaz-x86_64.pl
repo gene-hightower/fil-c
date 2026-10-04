@@ -955,9 +955,10 @@ $code.=<<___ if ($addx);
 	call	__rsaz_512_mulx
 
 ___
-if ($ENV{SARCASM}) { $code.="\tmovq	136(%rsp), $out\n\tmovq	152(%rsp), %rbp\n"; }
-else { $code.="\tmovq	%xmm0, $out\n\tmovq	%xmm1, %rbp\n"; }
-$code.=<<___;
+if ($addx) {
+    if ($ENV{SARCASM}) { $code.="\tmovq	136(%rsp), $out\n\tmovq	152(%rsp), %rbp\n"; }
+    else { $code.="\tmovq	%xmm0, $out\n\tmovq	%xmm1, %rbp\n"; }
+    $code.=<<___;
 
 	movq	128(%rsp), %rdx		# pull $n0
 	movq	(%rsp), %r8
@@ -972,6 +973,7 @@ $code.=<<___;
 	call	__rsaz_512_reducex
 .Lmul_tail:
 ___
+}
 $code.=<<___;
 	addq	64(%rsp), %r8
 	adcq	72(%rsp), %r9
@@ -1639,9 +1641,10 @@ $code.=<<___ if ($addx);
 	call	__rsaz_512_mulx
 
 ___
-if ($ENV{SARCASM}) { $code.="\tmovq	152(%rsp), $out\n\tmovq	160(%rsp), %rbp\n"; }
-else { $code.="\tmovq	%xmm0, $out\n\tmovq	%xmm1, %rbp\n"; }
-$code.=<<___;
+if ($addx) {
+    if ($ENV{SARCASM}) { $code.="\tmovq	152(%rsp), $out\n\tmovq	160(%rsp), %rbp\n"; }
+    else { $code.="\tmovq	%xmm0, $out\n\tmovq	%xmm1, %rbp\n"; }
+    $code.=<<___;
 
 	movq	128(%rsp), %rdx		# pull $n0
 	movq	(%rsp), %r8
@@ -1657,6 +1660,7 @@ $code.=<<___;
 
 .Lmul_scatter_tail:
 ___
+}
 $code.=<<___;
 	addq	64(%rsp), %r8
 	adcq	72(%rsp), %r9
