@@ -615,7 +615,11 @@ void zreturn(void* rets);
    that need to be written in assembly.
 
    The first argument is the Yolo symbol name of the function to be called. It must be a string
-   literal. The remaining arguments are passed along using Yolo C ABI conventions. */
+   literal. The remaining arguments are passed along using Yolo C ABI conventions.
+
+   The compiler only recognizes calls to these functions if you run it with the -yolo-assembler
+   option. If you don't, then calls to zunsafe_call will behave like calls to any other function
+   that is merely declared but not defined anywhere, so you will get a link error. */
 unsigned long zunsafe_call(const char* symbol_name, ...);
 
 /* Exactly like `zunsafe_call`, but for those cases where you know that the call will complete in a

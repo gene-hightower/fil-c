@@ -59,6 +59,10 @@ static cl::opt<bool> optimizeChecks(
 static cl::opt<bool> propagateChecksBackward(
   "filc-propagate-checks-backward", cl::desc("Perform backward propagation of checks"),
   cl::Hidden, cl::init(true));
+static cl::opt<bool> yoloAssembler(
+  "yolo-assembler",
+  cl::desc("Recognize the zunsafe_call, zunsafe_fast_call, and zunsafe_buf_call intrinsics"),
+  cl::Hidden, cl::init(false));
 
 // This has to match the FilC runtime.
 
@@ -8179,7 +8183,14 @@ class Pizlonator {
           return true;
         }
 
-        if ((((F->getName() == "zunsafe_call" || F->getName() == "zunsafe_fast_call") &&
+        // zunsafe_call, zunsafe_fast_call, and zunsafe_buf_call are only recognized if the
+        // compiler is run with -yolo-assembler. This is the same driver option that opts out
+        // of using the sarcasm pizlonating assembler for .s files. Running the compiler with
+        // it means that you want Yolo (unsafe) behavior for the things that the compiler
+        // cannot verify. Without this option, calls to functions with these names are treated
+        // like any other call to an external function.
+        if (yoloAssembler &&
+            (((F->getName() == "zunsafe_call" || F->getName() == "zunsafe_fast_call") &&
               FT->getNumParams() == 1 &&
               FT->getParamType(0) == RawPtrTy) ||
              (F->getName() == "zunsafe_buf_call" &&

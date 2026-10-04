@@ -866,7 +866,7 @@ def filc_no_ape : Flag<["--"], "filc-no-ape">, Flags<[NoXarchOption, HelpHidden]
   HelpText<"Internal: skip the APE post-link step in cosmo mode (used by the nested aarch64 link that --filc-fat-ape spawns)">;
 def yolo_assembler : Flag<["-"], "yolo-assembler">, Flags<[NoXarchOption]>,
   Visibility<[ClangOption]>,
-  HelpText<"Use the built-in YOLO assembler for .s inputs instead of sarcasm">;
+  HelpText<"Use the built-in YOLO assembler for .s inputs instead of sarcasm, and recognize the zunsafe_* unsafe call intrinsics">;
 def CC : Flag<["-"], "CC">, Visibility<[ClangOption, CC1Option]>,
   Group<Preprocessor_Group>,
     HelpText<"Include comments from within macros in preprocessed output">,
